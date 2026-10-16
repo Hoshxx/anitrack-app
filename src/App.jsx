@@ -3,52 +3,47 @@ import {
   ChevronLeft, ChevronRight, Calendar as CalendarIcon, Clock,
   Search, Check, Plus, Minus, RefreshCw, AlertTriangle, Info,
   Settings, ChevronDown, CheckCircle, Flame, Star,
-  X, ExternalLink, Heart, Film, Trash2, Users, TrendingUp
+  X, ExternalLink, Heart, Film, Trash2, Users, TrendingUp,
+  Filter, ArrowUpDown, Layers, Compass
 } from 'lucide-react';
 
-// --- Constants & Utilities ---
-const PHT_OFFSET = 8 * 60 * 60 * 1000; // +8 hours in ms
-const STORAGE_KEY = 'pht-anime-watchlist';
+const STORAGE_KEY = 'anitrack-watchlist';
 const ANILIST_API = 'https://graphql.anilist.co';
 
-const getPhtUnixNow = () => Math.floor(Date.now() / 1000);
+const getLocalUnixNow = () => Math.floor(Date.now() / 1000);
 
-// Robust PHT Date generation manipulating UTC representations to align with Manila day boundaries
-const createPhtDate = (timestampMs) => new Date(timestampMs + PHT_OFFSET);
-
-const getPhtStartOfDayUnix = (unix) => {
-  const d = createPhtDate(unix * 1000);
-  const start = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-  return Math.floor((start.getTime() - PHT_OFFSET) / 1000);
+const getLocalStartOfDayUnix = (unix) => {
+  const d = new Date(unix * 1000);
+  d.setHours(0, 0, 0, 0);
+  return Math.floor(d.getTime() / 1000);
 };
 
-const addPhtDays = (unix, deltaDays) => {
-  return unix + (deltaDays * 86400);
+const addLocalDays = (unix, deltaDays) => {
+  const d = new Date(unix * 1000);
+  d.setDate(d.getDate() + deltaDays);
+  return Math.floor(d.getTime() / 1000);
 };
 
-const addPhtMonths = (unix, deltaMonths) => {
-  const d = createPhtDate(unix * 1000);
-  d.setUTCDate(1); // Clamp to 1st to prevent month-skipping bugs on 31st
-  d.setUTCMonth(d.getUTCMonth() + deltaMonths);
-  return Math.floor((d.getTime() - PHT_OFFSET) / 1000);
+const addLocalMonths = (unix, deltaMonths) => {
+  const d = new Date(unix * 1000);
+  d.setDate(1);
+  d.setMonth(d.getMonth() + deltaMonths);
+  return Math.floor(d.getTime() / 1000);
 };
 
-const getDayOfWeekUnix = (unix) => {
-  const d = createPhtDate(unix * 1000);
-  const day = d.getUTCDay();
+const getDayOfWeekLocal = (unix) => {
+  const d = new Date(unix * 1000);
+  const day = d.getDay();
   return day === 0 ? 6 : day - 1; // Monday = 0, Sunday = 6
 };
 
-const getPhtDaysInMonth = (monthStartUnix) => {
-  const d = createPhtDate(monthStartUnix * 1000);
-  const year = d.getUTCFullYear();
-  const month = d.getUTCMonth();
-  return new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+const getLocalDaysInMonth = (monthStartUnix) => {
+  const d = new Date(monthStartUnix * 1000);
+  return new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
 };
 
-const formatPHT = (unix, options) => {
-  return new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Manila', ...options })
-    .format(new Date(unix * 1000));
+const formatLocal = (unix, options) => {
+  return new Intl.DateTimeFormat(undefined, options).format(new Date(unix * 1000));
 };
 
 const fetchGraphQL = async (query, variables, signal) => {
@@ -65,12 +60,11 @@ const fetchGraphQL = async (query, variables, signal) => {
   return json.data;
 };
 
-// Safe HTML cleaning for anime synopsis
 const parseSynopsis = (html) => {
   if (!html) return "No synopsis available.";
   let cleaned = html
     .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/p>/gi, '\n')
     .replace(/<[^>]+>/g, '')
     .replace(/&quot;/g, '"')
     .replace(/&#039;/g, "'")
@@ -80,7 +74,6 @@ const parseSynopsis = (html) => {
   return cleaned.trim() || "No synopsis available.";
 };
 
-// --- Context & Ticker Optimization ---
 const TickerContext = createContext(Date.now());
 const useTicker = () => useContext(TickerContext);
 
@@ -98,7 +91,6 @@ const TickerProvider = ({ children }) => {
   );
 };
 
-// Migrates legacy item structures safely
 const migrateWatchlistItem = (item) => {
   const statusMap = {
     'Watching': 'WATCHING',
@@ -144,14 +136,15 @@ const migrateWatchlistItem = (item) => {
     nextEpisodeAt: item.nextEpisodeAt ?? null,
     score: item.score ?? null,
     notes: item.notes ?? '',
-    favorite: item.favorite ?? false
+    favorite: item.favorite ?? false,
+    previousProgress: item.previousProgress ?? progress
   };
 };
 
 function useWatchlist() {
   const [watchlist, setWatchlist] = useState(() => {
     try {
-      const stored = localStorage.getItem(STORAGE_KEY);
+      const stored = localStorage.getItem(STORAGE_KEY) || localStorage.getItem('pht-anime-watchlist');
       if (!stored) return [];
       const parsed = JSON.parse(stored);
       if (!Array.isArray(parsed)) return [];
@@ -204,7 +197,8 @@ function useWatchlist() {
         nextEpisodeAt,
         score: null,
         notes: '',
-        favorite: false
+        favorite: false,
+        previousProgress: initialProgress || 1
       }];
     });
   }, []);
@@ -214,14 +208,43 @@ function useWatchlist() {
   }, []);
 
   const updateStatus = useCallback((id, newStatus) => {
-    setWatchlist(prev => prev.map(a => a.id === id ? { ...a, status: newStatus } : a));
+    setWatchlist(prev => prev.map(item => {
+      if (item.id !== id) return item;
+      
+      let newProgress = item.progress;
+      let prevProg = item.previousProgress ?? item.progress;
+
+      if (newStatus === 'COMPLETED') {
+        prevProg = item.progress > 0 ? item.progress : (item.totalEpisodes || 1);
+        newProgress = item.totalEpisodes || item.progress || 1;
+      } else if (item.status === 'COMPLETED' && newStatus === 'WATCHING') {
+        newProgress = prevProg > 0 ? prevProg : 1;
+      }
+
+      return {
+        ...item,
+        status: newStatus,
+        progress: newProgress,
+        previousProgress: prevProg
+      };
+    }));
   }, []);
 
   const setStatusAndAdd = useCallback((anime, newStatus) => {
     setWatchlist(prev => {
       const existing = prev.find(a => a.id === anime.id);
+      const totalEpisodes = anime.episodes || anime.totalEpisodes || null;
+      
       if (existing) {
-        return prev.map(a => a.id === anime.id ? { ...a, status: newStatus } : a);
+        let newProgress = existing.progress;
+        let prevProg = existing.previousProgress ?? existing.progress;
+        if (newStatus === 'COMPLETED') {
+          prevProg = existing.progress > 0 ? existing.progress : (totalEpisodes || 1);
+          newProgress = totalEpisodes || existing.progress || 1;
+        } else if (existing.status === 'COMPLETED' && newStatus === 'WATCHING') {
+          newProgress = prevProg > 0 ? prevProg : 1;
+        }
+        return prev.map(a => a.id === anime.id ? { ...a, status: newStatus, progress: newProgress, previousProgress: prevProg } : a);
       }
       
       const title = typeof anime.title === 'string'
@@ -232,11 +255,13 @@ function useWatchlist() {
         ? { large: anime.coverImage, extraLarge: anime.coverImage }
         : (anime.coverImage || { large: '', extraLarge: '' });
 
-      const totalEpisodes = anime.episodes || anime.totalEpisodes || null;
       const mediaStatus = anime.mediaStatus || anime.status || 'RELEASING';
       const nextAiring = anime.nextAiringEpisode;
       const airedEpisodes = anime.airedEpisodes ?? (nextAiring ? nextAiring.episode - 1 : (mediaStatus === 'FINISHED' ? totalEpisodes : null));
       const nextEpisodeAt = anime.nextEpisodeAt ?? nextAiring?.airingAt ?? null;
+
+      let initialProgress = 0;
+      if (newStatus === 'COMPLETED') initialProgress = totalEpisodes || 1;
 
       return [...prev, {
         id: anime.id,
@@ -244,14 +269,15 @@ function useWatchlist() {
         title,
         coverImage,
         status: newStatus,
-        progress: 0,
+        progress: initialProgress,
         totalEpisodes,
         mediaStatus,
         airedEpisodes,
         nextEpisodeAt,
         score: null,
         notes: '',
-        favorite: false
+        favorite: false,
+        previousProgress: initialProgress || 1
       }];
     });
   }, []);
@@ -269,6 +295,7 @@ function useWatchlist() {
       
       const clampedProgress = Math.max(0, Math.min(newProgress, maxAllowed));
       let status = item.status;
+      let prevProg = item.previousProgress;
       
       if (item.totalEpisodes && clampedProgress >= item.totalEpisodes && item.mediaStatus === 'FINISHED') {
         status = 'COMPLETED';
@@ -278,7 +305,9 @@ function useWatchlist() {
         status = 'WATCHING';
       }
 
-      return { ...item, progress: clampedProgress, status };
+      if (clampedProgress > 0) prevProg = clampedProgress;
+
+      return { ...item, progress: clampedProgress, status, previousProgress: prevProg };
     }));
   }, []);
 
@@ -294,7 +323,6 @@ function useWatchlist() {
     setWatchlist(prev => prev.map(a => a.id === id ? { ...a, favorite: !a.favorite } : a));
   }, []);
 
-  // Syncs watchlist items safely using ref
   const sync = useCallback(async () => {
     const currentList = watchlistRef.current;
     if (currentList.length === 0) return { success: true };
@@ -326,7 +354,6 @@ function useWatchlist() {
         if (data?.Page?.media) {
           allUpdates = allUpdates.concat(data.Page.media);
         }
-        // Respect AniList API rate limits if multiple chunks are needed
         if (chunks.length > 1) {
           await new Promise(resolve => setTimeout(resolve, 500)); 
         }
@@ -513,7 +540,7 @@ const PlayCircleIcon = ({ size = 20, className = "" }) => (
 );
 
 const EpisodeRow = ({ episode, itemStatus, itemProgress, onToggleWatched, openAnime }) => {
-  const now = getPhtUnixNow();
+  const now = getLocalUnixNow();
   const isAired = episode.airingAt <= now;
   const isWatched = itemProgress >= episode.episode;
   
@@ -555,7 +582,7 @@ const EpisodeRow = ({ episode, itemStatus, itemProgress, onToggleWatched, openAn
             {isAired ? "Aired" : "Upcoming"}
           </span>
           <span>•</span>
-          <span>{formatPHT(episode.airingAt, { hour: 'numeric', minute: '2-digit' })}</span>
+          <span>{formatLocal(episode.airingAt, { hour: 'numeric', minute: '2-digit' })}</span>
           {!isAired && (
             <>
               <span>•</span>
@@ -570,7 +597,7 @@ const EpisodeRow = ({ episode, itemStatus, itemProgress, onToggleWatched, openAn
 
 const CalendarView = ({ watchlist, updateProgress, updateStatus, add, openAnime }) => {
   const [mode, setMode] = useState('daily');
-  const [selectedUnix, setSelectedUnix] = useState(getPhtStartOfDayUnix(getPhtUnixNow()));
+  const [selectedUnix, setSelectedUnix] = useState(getLocalStartOfDayUnix(getLocalUnixNow()));
   const [myListOnly, setMyListOnly] = useState(watchlist.length > 0);
   
   const wIds = useMemo(() => watchlist.map(i => i.id), [watchlist]);
@@ -578,26 +605,26 @@ const CalendarView = ({ watchlist, updateProgress, updateStatus, add, openAnime 
   let startUnix, endUnix;
   if (mode === 'daily') {
     startUnix = selectedUnix;
-    endUnix = addPhtDays(selectedUnix, 1);
+    endUnix = addLocalDays(selectedUnix, 1);
   } else if (mode === 'weekly') {
-    const dayOfWeek = getDayOfWeekUnix(selectedUnix);
-    startUnix = addPhtDays(selectedUnix, -dayOfWeek);
-    endUnix = addPhtDays(startUnix, 7);
+    const dayOfWeek = getDayOfWeekLocal(selectedUnix);
+    startUnix = addLocalDays(selectedUnix, -dayOfWeek);
+    endUnix = addLocalDays(startUnix, 7);
   } else {
-    const d = createPhtDate(selectedUnix * 1000);
-    startUnix = getPhtStartOfDayUnix(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1) / 1000);
-    endUnix = addPhtMonths(startUnix, 1);
+    const d = new Date(selectedUnix * 1000);
+    startUnix = getLocalStartOfDayUnix(new Date(d.getFullYear(), d.getMonth(), 1).getTime() / 1000);
+    endUnix = addLocalMonths(startUnix, 1);
   }
 
   const { data: schedules, loading, error, retry } = useSchedulesRange(startUnix, endUnix, mode, myListOnly, wIds);
 
   const navDate = (delta) => {
-    if (mode === 'daily') setSelectedUnix(addPhtDays(selectedUnix, delta));
-    else if (mode === 'weekly') setSelectedUnix(addPhtDays(selectedUnix, delta * 7));
-    else setSelectedUnix(addPhtMonths(selectedUnix, delta));
+    if (mode === 'daily') setSelectedUnix(addLocalDays(selectedUnix, delta));
+    else if (mode === 'weekly') setSelectedUnix(addLocalDays(selectedUnix, delta * 7));
+    else setSelectedUnix(addLocalMonths(selectedUnix, delta));
   };
 
-  const navToday = () => setSelectedUnix(getPhtStartOfDayUnix(getPhtUnixNow()));
+  const navToday = () => setSelectedUnix(getLocalStartOfDayUnix(getLocalUnixNow()));
 
   const renderDaily = () => {
     if (loading) return <div className="p-8 text-center text-slate-400 animate-pulse">Loading schedule...</div>;
@@ -630,10 +657,10 @@ const CalendarView = ({ watchlist, updateProgress, updateStatus, add, openAnime 
     return (
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-7 gap-4">
         {Array.from({ length: 7 }).map((_, i) => {
-          const dayUnix = addPhtDays(startUnix, i);
-          const isToday = dayUnix === getPhtStartOfDayUnix(getPhtUnixNow());
+          const dayUnix = addLocalDays(startUnix, i);
+          const isToday = dayUnix === getLocalStartOfDayUnix(getLocalUnixNow());
           const isSelected = dayUnix === selectedUnix;
-          const daySchedules = schedules.filter(s => s.airingAt >= dayUnix && s.airingAt < addPhtDays(dayUnix, 1));
+          const daySchedules = schedules.filter(s => s.airingAt >= dayUnix && s.airingAt < addLocalDays(dayUnix, 1));
           
           return (
             <div key={i} 
@@ -642,14 +669,14 @@ const CalendarView = ({ watchlist, updateProgress, updateStatus, add, openAnime 
               ${isToday ? 'border-indigo-500 bg-indigo-500/5' : isSelected ? 'border-slate-500' : 'border-transparent'}`}
             >
               <div className="text-center mb-3">
-                <div className="text-xs text-slate-400 uppercase font-bold">{formatPHT(dayUnix, { weekday: 'short' })}</div>
+                <div className="text-xs text-slate-400 uppercase font-bold">{formatLocal(dayUnix, { weekday: 'short' })}</div>
                 <div className={`text-xl font-bold ${isToday ? 'text-indigo-400' : 'text-slate-200'}`}>
-                  {formatPHT(dayUnix, { day: 'numeric' })}
+                  {formatLocal(dayUnix, { day: 'numeric' })}
                 </div>
               </div>
               <div className="space-y-2">
                 {daySchedules.slice(0, 5).map(ep => (
-                  <div key={ep.id} className="text-xs p-2 bg-slate-800/80 rounded-lg flex items-center gap-3 overflow-hidden" title={ep.media.title.english || ep.media.title.romaji}>
+                  <div key={ep.id} onClick={(e) => { e.stopPropagation(); openAnime(ep.media.id); }} className="text-xs p-2 bg-slate-800/80 rounded-lg flex items-center gap-3 overflow-hidden cursor-pointer hover:bg-slate-700 transition-colors" title={ep.media.title.english || ep.media.title.romaji}>
                     <img src={ep.media.coverImage?.large} className="w-8 h-10 rounded object-cover flex-shrink-0" referrerPolicy="no-referrer" />
                     <div className="flex flex-col flex-1 min-w-0">
                       <span className="truncate font-medium text-slate-200">{ep.media.title.english || ep.media.title.romaji}</span>
@@ -670,9 +697,9 @@ const CalendarView = ({ watchlist, updateProgress, updateStatus, add, openAnime 
   const renderMonthly = () => {
     if (loading) return <div className="p-8 text-center text-slate-400 animate-pulse">Loading monthly grid...</div>;
 
-    const daysInMonth = getPhtDaysInMonth(startUnix);
-    const firstDayOfWeek = getDayOfWeekUnix(startUnix);
-    const todayStartUnix = getPhtStartOfDayUnix(getPhtUnixNow());
+    const daysInMonth = getLocalDaysInMonth(startUnix);
+    const firstDayOfWeek = getDayOfWeekLocal(startUnix);
+    const todayStartUnix = getLocalStartOfDayUnix(getLocalUnixNow());
 
     const paddingCells = Array.from({ length: firstDayOfWeek });
     const dayCells = Array.from({ length: daysInMonth }, (_, i) => i + 1);
@@ -689,8 +716,8 @@ const CalendarView = ({ watchlist, updateProgress, updateStatus, add, openAnime 
             <div key={`pad-${idx}`} className="bg-slate-900/20 rounded-xl min-h-[65px] sm:min-h-[85px]" />
           ))}
           {dayCells.map(dayNum => {
-            const dayStartUnix = addPhtDays(startUnix, dayNum - 1);
-            const dayEndUnix = addPhtDays(dayStartUnix, 1);
+            const dayStartUnix = addLocalDays(startUnix, dayNum - 1);
+            const dayEndUnix = addLocalDays(dayStartUnix, 1);
             const daySchedules = schedules.filter(s => s.airingAt >= dayStartUnix && s.airingAt < dayEndUnix);
             const isToday = dayStartUnix === todayStartUnix;
             const isSelected = dayStartUnix === selectedUnix;
@@ -746,9 +773,9 @@ const CalendarView = ({ watchlist, updateProgress, updateStatus, add, openAnime 
         <button onClick={() => navDate(-1)} className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-slate-300 transition-colors"><ChevronLeft size={20} /></button>
         <div className="text-center">
           <h2 className="text-xl font-bold text-slate-100">
-            {mode === 'daily' ? formatPHT(selectedUnix, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }) :
-             mode === 'weekly' ? `Week of ${formatPHT(startUnix, { month: 'short', day: 'numeric' })}` :
-             formatPHT(startUnix, { month: 'long', year: 'numeric' })}
+            {mode === 'daily' ? formatLocal(selectedUnix, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }) :
+             mode === 'weekly' ? `Week of ${formatLocal(startUnix, { month: 'short', day: 'numeric' })}` :
+             formatLocal(startUnix, { month: 'long', year: 'numeric' })}
           </h2>
           <button onClick={navToday} className="text-sm text-indigo-400 hover:text-indigo-300 font-medium mt-1">Go to Today</button>
         </div>
@@ -794,18 +821,18 @@ const CalendarView = ({ watchlist, updateProgress, updateStatus, add, openAnime 
   );
 };
 
-const DashboardStat = ({ icon: Icon, label, value, colorScheme }) => {
+const DashboardStat = ({ icon: Icon, label, value, colorScheme, onClick }) => {
   const schemes = {
-    rose: 'bg-rose-500/10 text-rose-400 border-rose-500/20',
-    emerald: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
-    amber: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
-    indigo: 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20'
+    rose: 'bg-rose-500/10 text-rose-400 border-rose-500/20 hover:border-rose-500/50',
+    emerald: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20 hover:border-emerald-500/50',
+    amber: 'bg-amber-500/10 text-amber-400 border-amber-500/20 hover:border-amber-500/50',
+    indigo: 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20 hover:border-indigo-500/50'
   };
 
   const schemeClass = schemes[colorScheme] || schemes.indigo;
 
   return (
-    <div className={`p-5 rounded-2xl border bg-slate-800/50 flex items-center gap-4 ${schemeClass}`}>
+    <div onClick={onClick} className={`p-5 rounded-2xl border bg-slate-800/50 flex items-center gap-4 cursor-pointer transition-all transform hover:scale-[1.02] ${schemeClass}`}>
       <div className={`p-3 rounded-xl ${schemeClass}`}>
         <Icon size={24} />
       </div>
@@ -817,7 +844,7 @@ const DashboardStat = ({ icon: Icon, label, value, colorScheme }) => {
   );
 };
 
-const Dashboard = ({ watchlist, updateProgress, updateStatus, add, sync, openAnime }) => {
+const Dashboard = ({ watchlist, updateProgress, updateStatus, add, sync, openAnime, setViewAndFilter }) => {
   const [syncing, setSyncing] = useState(false);
 
   const handleSync = async () => {
@@ -827,6 +854,7 @@ const Dashboard = ({ watchlist, updateProgress, updateStatus, add, sync, openAni
   };
 
   const watching = watchlist.filter(a => a.status === 'WATCHING');
+  const completed = watchlist.filter(a => a.status === 'COMPLETED');
   const epsWatched = watchlist.reduce((acc, curr) => acc + curr.progress, 0);
   const epsBehind = watching.reduce((acc, curr) => {
     if (curr.airedEpisodes !== null && curr.airedEpisodes !== undefined && curr.progress < curr.airedEpisodes) {
@@ -848,10 +876,10 @@ const Dashboard = ({ watchlist, updateProgress, updateStatus, add, sync, openAni
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <DashboardStat icon={Flame} label="Watching" value={watching.length} colorScheme="rose" />
-        <DashboardStat icon={CheckCircle} label="Completed" value={watchlist.filter(a => a.status === 'COMPLETED').length} colorScheme="emerald" />
-        <DashboardStat icon={Star} label="Eps Watched" value={epsWatched} colorScheme="amber" />
-        <DashboardStat icon={AlertTriangle} label="Eps Behind" value={epsBehind} colorScheme="indigo" />
+        <DashboardStat icon={Flame} label="Watching" value={watching.length} colorScheme="rose" onClick={() => setViewAndFilter('WATCHING')} />
+        <DashboardStat icon={CheckCircle} label="Completed" value={completed.length} colorScheme="emerald" onClick={() => setViewAndFilter('COMPLETED')} />
+        <DashboardStat icon={Star} label="Eps Watched" value={epsWatched} colorScheme="amber" onClick={() => setViewAndFilter('ALL')} />
+        <DashboardStat icon={AlertTriangle} label="Eps Behind" value={epsBehind} colorScheme="indigo" onClick={() => setViewAndFilter('WATCHING')} />
       </div>
 
       {continueWatching.length > 0 && (
@@ -889,7 +917,7 @@ const Dashboard = ({ watchlist, updateProgress, updateStatus, add, sync, openAni
       )}
 
       <div>
-        <h2 className="text-xl font-bold text-white mb-4">Release Calendar (PHT)</h2>
+        <h2 className="text-xl font-bold text-white mb-4">Release Calendar</h2>
         <CalendarView watchlist={watchlist} updateProgress={updateProgress} updateStatus={updateStatus} add={add} openAnime={openAnime} />
       </div>
     </div>
@@ -915,7 +943,6 @@ const WatchlistCard = ({ item, updateProgress, updateStatus, remove, openAnime }
         <img src={item.coverImage?.large} alt="" referrerPolicy="no-referrer" className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-105" />
         <div className="absolute inset-0 bg-gradient-to-t from-slate-900 via-slate-900/40 to-transparent" />
         
-        {/* Score & Favorite Badges */}
         <div className="absolute top-2 left-2 flex items-center gap-1.5">
           {item.score && (
             <span className="bg-amber-500/90 text-slate-950 font-extrabold text-[11px] px-2 py-0.5 rounded-md shadow-md flex items-center gap-0.5">
@@ -929,7 +956,6 @@ const WatchlistCard = ({ item, updateProgress, updateStatus, remove, openAnime }
           )}
         </div>
 
-        {/* Airing / Finished Status Badge */}
         <div className="absolute top-2 right-2">
           <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md shadow-md uppercase ${isAiring ? 'bg-indigo-500/90 text-white' : 'bg-slate-800/90 text-slate-300 border border-slate-700'}`}>
             {isAiring ? 'Airing' : 'Finished'}
@@ -993,12 +1019,12 @@ const WatchlistCard = ({ item, updateProgress, updateStatus, remove, openAnime }
           <select 
             value={item.status} 
             onChange={(e) => updateStatus(item.id, e.target.value)}
-            className="bg-slate-900 text-xs text-slate-300 rounded px-2 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 w-full xl:w-auto"
+            className="bg-slate-900 text-xs text-slate-300 rounded px-2 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 w-full xl:w-auto cursor-pointer"
           >
             <option value="WATCHING">Watching</option>
             <option value="PLAN_TO_WATCH">Plan to Watch</option>
             <option value="COMPLETED">Completed</option>
-            <option value="PAUSED">On Hold / Paused</option>
+            <option value="PAUSED">On Hold</option>
             <option value="DROPPED">Dropped</option>
           </select>
           <button onClick={() => remove(item.id)} className="text-slate-500 hover:text-red-400 text-xs transition-colors text-left xl:text-right py-1">Remove</button>
@@ -1008,38 +1034,95 @@ const WatchlistCard = ({ item, updateProgress, updateStatus, remove, openAnime }
   );
 };
 
-const Watchlist = ({ watchlist, updateProgress, updateStatus, remove, openAnime }) => {
-  const [filter, setFilter] = useState('ALL');
-  const filtered = filter === 'ALL' ? watchlist : watchlist.filter(a => a.status === filter);
+const Watchlist = ({ watchlist, updateProgress, updateStatus, remove, openAnime, initialFilter = 'ALL' }) => {
+  const [filter, setFilter] = useState(initialFilter);
+  const [search, setSearch] = useState('');
+  const [sortBy, setSortBy] = useState('title');
+
+  useEffect(() => {
+    setFilter(initialFilter);
+  }, [initialFilter]);
+
+  const filteredAndSorted = useMemo(() => {
+    let result = filter === 'ALL' ? watchlist : watchlist.filter(a => a.status === filter);
+    
+    if (search.trim()) {
+      const query = search.toLowerCase();
+      result = result.filter(a => (a.title?.english || '').toLowerCase().includes(query) || (a.title?.romaji || '').toLowerCase().includes(query));
+    }
+
+    return [...result].sort((a, b) => {
+      if (sortBy === 'title') {
+        const titleA = a.title?.english || a.title?.romaji || '';
+        const titleB = b.title?.english || b.title?.romaji || '';
+        return titleA.localeCompare(titleB);
+      } else if (sortBy === 'progress') {
+        return b.progress - a.progress;
+      } else if (sortBy === 'score') {
+        return (b.score || 0) - (a.score || 0);
+      } else if (sortBy === 'favorite') {
+        return (b.favorite ? 1 : 0) - (a.favorite ? 1 : 0);
+      }
+      return 0;
+    });
+  }, [watchlist, filter, search, sortBy]);
 
   return (
     <div className="space-y-6">
-      <div className="flex justify-between items-center flex-wrap gap-4">
+      <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
         <h1 className="text-3xl font-bold text-white">My Watchlist</h1>
-        <div className="flex gap-2 bg-slate-800 p-1 rounded-lg flex-wrap">
-          {[
-            { key: 'ALL', label: 'All' },
-            { key: 'WATCHING', label: 'Watching' },
-            { key: 'PLAN_TO_WATCH', label: 'Plan to Watch' },
-            { key: 'COMPLETED', label: 'Completed' },
-            { key: 'PAUSED', label: 'On Hold' },
-            { key: 'DROPPED', label: 'Dropped' }
-          ].map(f => (
-            <button key={f.key} onClick={() => setFilter(f.key)}
-              className={`px-3 py-1.5 rounded-md text-xs sm:text-sm font-medium transition-colors ${filter === f.key ? 'bg-indigo-500 text-white' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-700'}`}>
-              {f.label}
-            </button>
-          ))}
+        
+        <div className="flex items-center gap-3 w-full md:w-auto flex-wrap">
+          <div className="relative flex-1 md:w-48">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
+            <input 
+              type="text" 
+              value={search} 
+              onChange={e => setSearch(e.target.value)}
+              placeholder="Filter list..."
+              className="w-full bg-slate-800 text-white text-sm rounded-lg pl-9 pr-3 py-2 border border-slate-700 outline-none focus:border-indigo-500"
+            />
+          </div>
+
+          <div className="flex items-center gap-2 bg-slate-800 px-3 py-2 rounded-lg border border-slate-700 cursor-pointer">
+            <ArrowUpDown size={16} className="text-indigo-400" />
+            <select 
+              value={sortBy} 
+              onChange={e => setSortBy(e.target.value)}
+              className="bg-transparent text-sm text-slate-300 outline-none cursor-pointer"
+            >
+              <option value="title" className="bg-slate-800">Sort: Title</option>
+              <option value="progress" className="bg-slate-800">Sort: Progress</option>
+              <option value="score" className="bg-slate-800">Sort: Score</option>
+              <option value="favorite" className="bg-slate-800">Sort: Favorites</option>
+            </select>
+          </div>
         </div>
       </div>
 
-      {filtered.length === 0 ? (
+      <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-hide">
+        {[
+          { key: 'ALL', label: 'All' },
+          { key: 'WATCHING', label: 'Watching' },
+          { key: 'PLAN_TO_WATCH', label: 'Plan to Watch' },
+          { key: 'COMPLETED', label: 'Completed' },
+          { key: 'PAUSED', label: 'On Hold' },
+          { key: 'DROPPED', label: 'Dropped' }
+        ].map(f => (
+          <button key={f.key} onClick={() => setFilter(f.key)}
+            className={`flex-shrink-0 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${filter === f.key ? 'bg-indigo-500 text-white shadow-sm' : 'bg-slate-800/80 text-slate-400 hover:text-slate-200 hover:bg-slate-700'}`}>
+            {f.label}
+          </button>
+        ))}
+      </div>
+
+      {filteredAndSorted.length === 0 ? (
         <div className="text-center py-20 text-slate-400 bg-slate-800/30 rounded-2xl border border-slate-800">
-          No anime found in this category.
+          No anime found matching your filters.
         </div>
       ) : (
         <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4 lg:gap-6">
-          {filtered.map(item => (
+          {filteredAndSorted.map(item => (
             <WatchlistCard key={item.id} item={item} updateProgress={updateProgress} updateStatus={updateStatus} remove={remove} openAnime={openAnime} />
           ))}
         </div>
@@ -1102,13 +1185,13 @@ const Seasonal = ({ watchlist, add, openAnime }) => {
       <div className="flex justify-between items-center flex-wrap gap-4">
         <h1 className="text-3xl font-bold text-white">Seasonal Anime</h1>
         <div className="flex gap-4">
-          <select value={season} onChange={e => setSeason(e.target.value)} className="bg-slate-800 text-white rounded-lg px-4 py-2 border border-slate-700 outline-none focus:border-indigo-500">
+          <select value={season} onChange={e => setSeason(e.target.value)} className="bg-slate-800 text-white rounded-lg px-4 py-2 border border-slate-700 outline-none focus:border-indigo-500 cursor-pointer">
             <option value="WINTER">Winter</option>
             <option value="SPRING">Spring</option>
             <option value="SUMMER">Summer</option>
             <option value="FALL">Fall</option>
           </select>
-          <select value={year} onChange={e => setYear(Number(e.target.value))} className="bg-slate-800 text-white rounded-lg px-4 py-2 border border-slate-700 outline-none focus:border-indigo-500">
+          <select value={year} onChange={e => setYear(Number(e.target.value))} className="bg-slate-800 text-white rounded-lg px-4 py-2 border border-slate-700 outline-none focus:border-indigo-500 cursor-pointer">
             {Array.from({ length: new Date().getFullYear() - 1989 }, (_, i) => new Date().getFullYear() + 1 - i).map(y => (
               <option key={y} value={y}>{y}</option>
             ))}
@@ -1276,7 +1359,6 @@ const SearchAnime = ({ watchlist, add, openAnime }) => {
   );
 };
 
-// Anime Detail Modal Component
 const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
   const { watchlist, add, remove, updateStatus, setStatusAndAdd, updateProgress, setScore, setNotes, toggleFavorite } = watchlistObj;
   const [data, setData] = useState(null);
@@ -1287,7 +1369,6 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
 
   const watchItem = useMemo(() => watchlist.find(w => w.id === animeId), [watchlist, animeId]);
 
-  // Lock body scroll while open & attach Escape listener
   useEffect(() => {
     if (!animeId) return;
     const origOverflow = document.body.style.overflow;
@@ -1304,7 +1385,6 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
     };
   }, [animeId, onClose]);
 
-  // Fetch Media details with caching & abort
   const fetchData = useCallback(async () => {
     if (!animeId) return;
 
@@ -1340,6 +1420,16 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
           startDate { year month day }
           endDate { year month day }
           externalLinks { url site type }
+          relations {
+            edges {
+              relationType
+              node {
+                id type format status episodes
+                title { romaji english }
+                coverImage { large }
+              }
+            }
+          }
           isAdult
         }
       }
@@ -1407,6 +1497,8 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
 
   const streamingLinks = (data?.externalLinks || []).filter(l => l.type === 'STREAMING' || l.site?.toLowerCase().includes('crunchyroll') || l.site?.toLowerCase().includes('netflix') || l.site?.toLowerCase().includes('hulu') || l.site?.toLowerCase().includes('bilibili')).slice(0, 6);
 
+  const franchiseRelations = (data?.relations?.edges || []).filter(r => r.node && r.node.type === 'ANIME' && ['SEQUEL', 'PREQUEL', 'SIDE_STORY', 'PARENT', 'CHILD', 'ALTERNATIVE', 'SPIN_OFF'].includes(r.relationType));
+
   return (
     <div 
       onClick={handleBackdropClick} 
@@ -1445,7 +1537,6 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
 
         {(data || watchItem) && (
           <div className="flex-1 space-y-6 pb-8">
-            {/* Banner & Poster */}
             <div className="relative">
               <div className="h-44 sm:h-60 w-full overflow-hidden bg-gradient-to-r from-indigo-900/50 via-slate-800 to-purple-900/50 relative">
                 {bannerImg ? (
@@ -1491,102 +1582,49 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
                   {titleRomaji && titleRomaji !== titleDisplay && (
                     <p className="text-xs text-slate-400 font-medium">{titleRomaji}</p>
                   )}
-                  {titleNative && (
-                    <p className="text-xs text-slate-500">{titleNative}</p>
-                  )}
                 </div>
               </div>
             </div>
 
             <div className="px-6 space-y-6">
-              {/* Meta Subheader */}
               <div className="text-xs sm:text-sm text-slate-400 border-b border-slate-800 pb-3 flex items-center gap-2 flex-wrap font-medium">
                 <span className="text-slate-200">{studioName}</span>
                 <span>•</span>
                 <span>{totalEps ? `${totalEps} Episodes` : 'Episodes TBA'}</span>
                 <span>•</span>
                 <span>{data?.duration ? `${data.duration} min/ep` : 'Standard Duration'}</span>
-                {data?.source && (
-                  <>
-                    <span>•</span>
-                    <span className="uppercase text-indigo-300 font-semibold">{data.source.replace(/_/g, ' ')}</span>
-                  </>
-                )}
               </div>
 
-              {/* Airing / Release Status */}
-              <div className="bg-slate-800/60 border border-slate-700/60 rounded-xl p-4 flex items-center justify-between flex-wrap gap-3">
-                {nextAiringAt ? (
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-lg bg-indigo-500/20 text-indigo-400 flex items-center justify-center flex-shrink-0">
-                      <Clock size={20} />
-                    </div>
-                    <div>
-                      <div className="text-xs text-slate-400 font-medium uppercase tracking-wider">Next Release</div>
-                      <div className="text-sm font-bold text-white">
-                        Ep {nextEpNum || '?'} • {formatPHT(nextAiringAt, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })} PHT
+              {franchiseRelations.length > 0 && (
+                <div className="space-y-3 bg-slate-800/40 border border-slate-700/60 p-4 rounded-xl">
+                  <h3 className="font-bold text-white text-sm flex items-center gap-2">
+                    <Layers size={16} className="text-indigo-400" /> Seasons & Franchise Relations
+                  </h3>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {franchiseRelations.map(rel => (
+                      <div 
+                        key={rel.node.id} 
+                        onClick={() => openAnime(rel.node.id)}
+                        className="flex items-center gap-3 bg-slate-900/60 hover:bg-slate-800 p-2 rounded-lg border border-slate-800 hover:border-indigo-500/50 cursor-pointer transition-all group"
+                      >
+                        <img src={rel.node.coverImage?.large} alt="" referrerPolicy="no-referrer" className="w-10 h-12 object-cover rounded flex-shrink-0" />
+                        <div className="min-w-0 flex-1">
+                          <span className="text-[10px] text-indigo-300 font-bold uppercase tracking-wider block leading-none mb-1">
+                            {rel.relationType.replace(/_/g, ' ')}
+                          </span>
+                          <h4 className="text-xs font-semibold text-slate-200 truncate group-hover:text-indigo-300 transition-colors">
+                            {rel.node.title?.english || rel.node.title?.romaji}
+                          </h4>
+                          <span className="text-[10px] text-slate-400 uppercase">
+                            {rel.node.format || 'TV'} • {rel.node.episodes ? `${rel.node.episodes} eps` : 'TBA'}
+                          </span>
+                        </div>
                       </div>
-                    </div>
+                    ))}
                   </div>
-                ) : (
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-lg bg-slate-800 text-slate-400 flex items-center justify-center flex-shrink-0">
-                      <Film size={20} />
-                    </div>
-                    <div>
-                      <div className="text-xs text-slate-400 font-medium uppercase tracking-wider">Airing Status</div>
-                      <div className="text-sm font-bold text-slate-200">
-                        {mediaStatus === 'FINISHED' ? 'All episodes aired' : 'Release schedule TBA'}
-                      </div>
-                    </div>
-                  </div>
-                )}
+                </div>
+              )}
 
-                {nextAiringAt && (
-                  <div className="text-sm font-bold bg-indigo-500/10 border border-indigo-500/30 px-3 py-1.5 rounded-lg text-indigo-300">
-                    Releases in <CountdownLabel unixTarget={nextAiringAt} />
-                  </div>
-                )}
-              </div>
-
-              {/* Ratings & Rankings */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                {data?.averageScore !== undefined && data?.averageScore !== null && (
-                  <div className="bg-slate-800/40 border border-slate-800 p-3 rounded-xl">
-                    <div className="text-xs text-slate-400">Average Score</div>
-                    <div className="text-xl font-bold text-amber-400 mt-1">{data.averageScore}%</div>
-                    <div className="w-full bg-slate-700 h-1.5 rounded-full mt-2 overflow-hidden">
-                      <div className="bg-amber-400 h-full rounded-full" style={{ width: `${data.averageScore}%` }} />
-                    </div>
-                  </div>
-                )}
-                {data?.popularity !== undefined && data?.popularity !== null && (
-                  <div className="bg-slate-800/40 border border-slate-800 p-3 rounded-xl">
-                    <div className="text-xs text-slate-400">Popularity</div>
-                    <div className="text-xl font-bold text-indigo-400 mt-1 flex items-center gap-1.5">
-                      <Users size={16} /> {data.popularity.toLocaleString()}
-                    </div>
-                  </div>
-                )}
-                {data?.favourites !== undefined && data?.favourites !== null && (
-                  <div className="bg-slate-800/40 border border-slate-800 p-3 rounded-xl">
-                    <div className="text-xs text-slate-400">Favorites</div>
-                    <div className="text-xl font-bold text-rose-400 mt-1 flex items-center gap-1.5">
-                      <Heart size={16} /> {data.favourites.toLocaleString()}
-                    </div>
-                  </div>
-                )}
-                {bestRanking && (
-                  <div className="bg-slate-800/40 border border-slate-800 p-3 rounded-xl">
-                    <div className="text-xs text-slate-400">Ranked</div>
-                    <div className="text-sm font-bold text-emerald-400 mt-1 flex items-center gap-1">
-                      <TrendingUp size={16} /> #{bestRanking.rank} {bestRanking.context || bestRanking.type}
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* My Progress Box */}
               <div className="bg-slate-800/80 border border-slate-700 p-5 rounded-2xl space-y-4">
                 <div className="flex items-center justify-between flex-wrap gap-2">
                   <h3 className="font-bold text-white text-base flex items-center gap-2">
@@ -1605,7 +1643,6 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                  {/* Status Dropdown */}
                   <div>
                     <label className="block text-xs text-slate-400 font-medium mb-1">Status</label>
                     <select 
@@ -1620,7 +1657,7 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
                           setStatusAndAdd(data || { id: animeId, title: titleDisplay, coverImage: coverImg }, val);
                         }
                       }}
-                      className="w-full bg-slate-900 border border-slate-700 text-slate-200 text-xs rounded-xl px-3 py-2 outline-none focus:border-indigo-500"
+                      className="w-full bg-slate-900 border border-slate-700 text-slate-200 text-xs rounded-xl px-3 py-2 outline-none focus:border-indigo-500 cursor-pointer"
                     >
                       <option value="NOT_IN_LIST">Not in my list</option>
                       <option value="WATCHING">Watching</option>
@@ -1631,7 +1668,6 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
                     </select>
                   </div>
 
-                  {/* Progress Inputs */}
                   <div>
                     <label className="block text-xs text-slate-400 font-medium mb-1">Progress</label>
                     <div className="flex items-center gap-2">
@@ -1664,14 +1700,13 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
                     </div>
                   </div>
 
-                  {/* Rating Score */}
                   <div>
                     <label className="block text-xs text-slate-400 font-medium mb-1">My Score</label>
                     <select 
                       disabled={!watchItem}
                       value={watchItem?.score || ''}
                       onChange={(e) => watchItem && setScore(animeId, e.target.value)}
-                      className="w-full bg-slate-900 border border-slate-700 text-slate-200 text-xs rounded-xl px-3 py-2 outline-none focus:border-indigo-500 disabled:opacity-50"
+                      className="w-full bg-slate-900 border border-slate-700 text-slate-200 text-xs rounded-xl px-3 py-2 outline-none focus:border-indigo-500 disabled:opacity-50 cursor-pointer"
                     >
                       <option value="">No rating</option>
                       {[10, 9, 8, 7, 6, 5, 4, 3, 2, 1].map(num => (
@@ -1681,7 +1716,6 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
                   </div>
                 </div>
 
-                {/* Episode Grid */}
                 {watchItem && (
                   <div className="pt-2 border-t border-slate-700/60">
                     <div className="flex items-center justify-between mb-2">
@@ -1689,7 +1723,7 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
                       {totalEps && mediaStatus === 'FINISHED' && watchItem.progress < totalEps && (
                         <button 
                           onClick={() => updateProgress(animeId, totalEps)}
-                          className="text-xs text-indigo-400 hover:text-indigo-300 font-semibold"
+                          className="text-xs text-indigo-400 hover:text-indigo-300 font-semibold transition-colors"
                         >
                           Mark all completed ({totalEps})
                         </button>
@@ -1725,128 +1759,37 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
                     </div>
                   </div>
                 )}
-
-                {/* Personal Notes */}
-                {watchItem && (
-                  <div>
-                    <label className="block text-xs text-slate-400 font-medium mb-1">Personal Notes</label>
-                    <textarea 
-                      defaultValue={watchItem.notes || ''}
-                      onBlur={(e) => setNotes(animeId, e.target.value)}
-                      placeholder="Write private thoughts, favorite characters, or review notes..."
-                      className="w-full h-16 bg-slate-900 border border-slate-700 text-slate-200 text-xs rounded-xl p-2.5 outline-none focus:border-indigo-500 resize-none"
-                    />
-                  </div>
-                )}
-
-                {watchItem && (
-                  <div className="flex justify-end pt-1">
-                    <button 
-                      onClick={() => remove(animeId)} 
-                      className="text-xs text-red-400 hover:text-red-300 font-medium inline-flex items-center gap-1 transition-colors"
-                    >
-                      <Trash2 size={13} /> Remove from Watchlist
-                    </button>
-                  </div>
-                )}
               </div>
 
-              {/* Synopsis */}
+              {/* Synopsis with normal line heights and compact paragraph spacing */}
               <div className="space-y-2">
                 <h3 className="font-bold text-white text-base">Synopsis</h3>
-                <div className="text-sm text-slate-300 leading-relaxed whitespace-pre-line bg-slate-800/30 border border-slate-800 p-4 rounded-xl">
+                <div className="text-sm text-slate-300 leading-normal space-y-3 bg-slate-800/30 border border-slate-800 p-4 rounded-xl">
                   {isLongSynopsis && !showFullSynopsis ? (
                     <>
-                      {cleanedSynopsis.slice(0, 400)}...
+                      <p>{cleanedSynopsis.slice(0, 400)}...</p>
                       <button 
                         onClick={() => setShowFullSynopsis(true)}
-                        className="ml-2 text-indigo-400 font-bold hover:underline inline-block"
+                        className="text-indigo-400 font-bold hover:underline inline-block mt-1"
                       >
                         Read more
                       </button>
                     </>
                   ) : (
                     <>
-                      {cleanedSynopsis}
+                      {cleanedSynopsis.split('\n').map((paragraph, idx) => (
+                        paragraph.trim() ? <p key={idx}>{paragraph}</p> : null
+                      ))}
                       {isLongSynopsis && (
                         <button 
                           onClick={() => setShowFullSynopsis(false)}
-                          className="ml-2 text-indigo-400 font-bold hover:underline inline-block"
+                          className="text-indigo-400 font-bold hover:underline inline-block mt-2"
                         >
                           Show less
                         </button>
                       )}
                     </>
                   )}
-                </div>
-              </div>
-
-              {/* Genres & Information */}
-              <div className="space-y-3">
-                <h3 className="font-bold text-white text-base">Genres & Information</h3>
-                <div className="flex flex-wrap gap-2">
-                  {(data?.genres || []).map(g => (
-                    <span key={g} className="bg-slate-800 border border-slate-700/80 text-indigo-300 text-xs px-3 py-1 rounded-full font-medium">
-                      {g}
-                    </span>
-                  ))}
-                </div>
-
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-xs bg-slate-800/20 p-3 rounded-xl border border-slate-800">
-                  <div>
-                    <span className="text-slate-500 block">Start Date</span>
-                    <span className="text-slate-300 font-medium">
-                      {data?.startDate?.year ? `${data.startDate.year}-${data.startDate.month || 1}-${data.startDate.day || 1}` : 'Unknown'}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-slate-500 block">End Date</span>
-                    <span className="text-slate-300 font-medium">
-                      {data?.endDate?.year ? `${data.endDate.year}-${data.endDate.month || 1}-${data.endDate.day || 1}` : 'Airing / Unknown'}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-slate-500 block">Source Material</span>
-                    <span className="text-slate-300 font-medium">{data?.source ? data.source.replace(/_/g, ' ') : 'Unknown'}</span>
-                  </div>
-                </div>
-              </div>
-
-              {/* External Links */}
-              <div className="space-y-3 pt-2 border-t border-slate-800">
-                <h3 className="font-bold text-white text-base">External & Streaming Links</h3>
-                <div className="flex flex-wrap gap-2">
-                  <a 
-                    href={`https://anilist.co/anime/${data?.id || animeId}`} 
-                    target="_blank" 
-                    rel="noreferrer"
-                    className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs px-3.5 py-2 rounded-xl font-semibold flex items-center gap-1.5 transition-colors shadow-md"
-                  >
-                    <ExternalLink size={14} /> AniList
-                  </a>
-
-                  {(data?.idMal || watchItem?.idMal) && (
-                    <a 
-                      href={`https://myanimelist.net/anime/${data?.idMal || watchItem?.idMal}`} 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="bg-blue-600 hover:bg-blue-500 text-white text-xs px-3.5 py-2 rounded-xl font-semibold flex items-center gap-1.5 transition-colors shadow-md"
-                    >
-                      <ExternalLink size={14} /> MyAnimeList
-                    </a>
-                  )}
-
-                  {streamingLinks.map(link => (
-                    <a 
-                      key={link.url} 
-                      href={link.url} 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs px-3 py-2 rounded-xl font-medium flex items-center gap-1.5 transition-colors"
-                    >
-                      <ExternalLink size={13} /> {link.site || 'Watch Stream'}
-                    </a>
-                  ))}
                 </div>
               </div>
             </div>
@@ -1859,6 +1802,7 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
 
 export default function App() {
   const [currentView, setCurrentView] = useState('dashboard');
+  const [watchlistFilter, setWatchlistFilter] = useState('ALL');
   const [selectedAnimeId, setSelectedAnimeId] = useState(null);
   const w = useWatchlist();
 
@@ -1870,7 +1814,11 @@ export default function App() {
     setSelectedAnimeId(null);
   }, []);
 
-  // Sync Watchlist initially and every 30 minutes
+  const setViewAndFilter = useCallback((filter) => {
+    setWatchlistFilter(filter);
+    setCurrentView('watchlist');
+  }, []);
+
   useEffect(() => {
     w.sync();
     const syncInterval = setInterval(() => w.sync(), 30 * 60 * 1000);
@@ -1878,8 +1826,8 @@ export default function App() {
   }, [w.sync]);
 
   const views = {
-    dashboard: <Dashboard watchlist={w.watchlist} updateProgress={w.updateProgress} updateStatus={w.updateStatus} add={w.add} sync={w.sync} openAnime={openAnime} />,
-    watchlist: <Watchlist watchlist={w.watchlist} updateProgress={w.updateProgress} updateStatus={w.updateStatus} remove={w.remove} openAnime={openAnime} />,
+    dashboard: <Dashboard watchlist={w.watchlist} updateProgress={w.updateProgress} updateStatus={w.updateStatus} add={w.add} sync={w.sync} openAnime={openAnime} setViewAndFilter={setViewAndFilter} />,
+    watchlist: <Watchlist watchlist={w.watchlist} updateProgress={w.updateProgress} updateStatus={w.updateStatus} remove={w.remove} openAnime={openAnime} initialFilter={watchlistFilter} />,
     seasonal: <Seasonal watchlist={w.watchlist} add={w.add} openAnime={openAnime} />,
     search: <SearchAnime watchlist={w.watchlist} add={w.add} openAnime={openAnime} />
   };
@@ -1893,11 +1841,11 @@ export default function App() {
               <div className="w-8 h-8 rounded-lg bg-indigo-500/20 flex items-center justify-center">
                 <Clock size={20} />
               </div>
-              <span className="text-xl font-bold tracking-tight text-white">AniTrack<span className="text-indigo-500">PHT</span></span>
+              <span className="text-xl font-bold tracking-tight text-white">AniTrack</span>
             </div>
             <nav className="hidden md:flex gap-1 bg-slate-800/50 p-1 rounded-xl">
               {['dashboard', 'watchlist', 'seasonal', 'search'].map(v => (
-                <button key={v} onClick={() => setCurrentView(v)}
+                <button key={v} onClick={() => { if (v === 'watchlist') setWatchlistFilter('ALL'); setCurrentView(v); }}
                   className={`px-4 py-1.5 rounded-lg text-sm font-medium capitalize transition-all
                   ${currentView === v ? 'bg-indigo-500 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-700/50'}`}>
                   {v}
@@ -1905,15 +1853,16 @@ export default function App() {
               ))}
             </nav>
             <div className="flex items-center gap-4 text-sm font-medium">
-              <span className="hidden sm:inline-block text-slate-500">{formatPHT(getPhtUnixNow(), { dateStyle: 'long', timeStyle: 'short' })} PHT</span>
+              <span className="hidden sm:inline-block text-slate-500">
+                {formatLocal(getLocalUnixNow(), { dateStyle: 'long', timeStyle: 'short' })}
+              </span>
             </div>
           </div>
         </header>
 
-        {/* Mobile Nav */}
         <div className="md:hidden flex overflow-x-auto gap-2 p-4 bg-slate-900 border-b border-slate-800">
           {['dashboard', 'watchlist', 'seasonal', 'search'].map(v => (
-            <button key={v} onClick={() => setCurrentView(v)}
+            <button key={v} onClick={() => { if (v === 'watchlist') setWatchlistFilter('ALL'); setCurrentView(v); }}
               className={`flex-shrink-0 px-4 py-2 rounded-lg text-sm font-medium capitalize
               ${currentView === v ? 'bg-indigo-500 text-white' : 'bg-slate-800 text-slate-400'}`}>
               {v}
@@ -1925,7 +1874,6 @@ export default function App() {
           {views[currentView]}
         </main>
 
-        {/* Global Anime Detail Modal */}
         {selectedAnimeId && (
           <AnimeDetailModal 
             animeId={selectedAnimeId} 
