@@ -1372,6 +1372,8 @@ const SearchAnime = ({ watchlist, add, openAnime }) => {
   useEffect(() => () => abortRef.current?.abort(), []);
 
   const performSearch = async (searchQuery, p = 1, append = false) => {
+    console.log("performSearch called! Query:", searchQuery, "Filters active:", hasFilters);
+
     if (!searchQuery.trim() && !hasFilters) return;
     abortRef.current?.abort();
     const controller = new AbortController();
