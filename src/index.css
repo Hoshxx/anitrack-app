@@ -1,17 +1,93 @@
 @import "tailwindcss";
 
-/* Custom scrollbar styling for slick anime dark theme */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+@theme {
+  --font-sans: 'DM Sans Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-display: 'Bricolage Grotesque Variable', 'DM Sans Variable', ui-sans-serif, system-ui, sans-serif;
+  --radius-xl: 0.625rem;
+  --radius-2xl: 0.875rem;
 }
-::-webkit-scrollbar-track {
-  background: #0f172a;
+
+/* ---------- Dark theme (default): warm ink instead of blue-slate ---------- */
+html, html[data-theme='dark'] {
+  color-scheme: dark;
+  --color-slate-950: #0e0d0c; --color-slate-900: #151412; --color-slate-800: #1f1d1a;
+  --color-slate-700: #2e2b26; --color-slate-600: #47433b; --color-slate-500: #6d685d;
+  --color-slate-400: #9a9486; --color-slate-300: #bdb7a8; --color-slate-200: #d6d1c4;
+  --color-slate-100: #e9e5da; --color-slate-50: #f6f3ec;
+  /* accent: vermilion */
+  --color-indigo-200: #ffd0c4; --color-indigo-300: #ffab97; --color-indigo-400: #ff8266;
+  --color-indigo-500: #f0553a; --color-indigo-600: #d63f26; --color-indigo-900: #5a1d12;
+  --color-indigo-950: #3b1109; --color-purple-900: #4a1a10;
 }
-::-webkit-scrollbar-thumb {
-  background: #334155;
-  border-radius: 3px;
+html[data-accent='teal'] {
+  --color-indigo-200: #a7f0e6; --color-indigo-300: #6fe0d1; --color-indigo-400: #34c9b8;
+  --color-indigo-500: #14a597; --color-indigo-600: #0e857a; --color-indigo-900: #0b3d38;
+  --color-indigo-950: #072926; --color-purple-900: #0a3530;
 }
-::-webkit-scrollbar-thumb:hover {
-  background: #475569;
+html[data-accent='indigo'] {
+  --color-indigo-200: #c7d2fe; --color-indigo-300: #a5b4fc; --color-indigo-400: #818cf8;
+  --color-indigo-500: #6366f1; --color-indigo-600: #4f46e5; --color-indigo-900: #312e81;
+  --color-indigo-950: #1e1b4b; --color-purple-900: #4c1d95;
 }
+
+/* ---------- Light theme: warm paper ---------- */
+html[data-theme='light'] {
+  color-scheme: light;
+  --color-slate-950: #fbfaf7; --color-slate-900: #f4f2ec; --color-slate-800: #e9e6dd;
+  --color-slate-700: #d8d4c8; --color-slate-600: #bcb7a8; --color-slate-500: #8b8678;
+  --color-slate-400: #6b665a; --color-slate-300: #4a463d; --color-slate-200: #37342d;
+  --color-slate-100: #26241f; --color-slate-50: #181714;
+  /* darker text-tones so accent and status colors stay readable on light */
+  --color-indigo-200: #8a2a16; --color-indigo-300: #b23520; --color-indigo-400: #c2391f;
+  --color-indigo-500: #e0492e; --color-indigo-600: #bf3a22; --color-indigo-900: #ffd9cf;
+  --color-indigo-950: #ffece6; --color-purple-900: #ffe3da;
+  --color-emerald-400: #047857; --color-amber-200: #78350f; --color-amber-300: #92400e;
+  --color-amber-400: #b45309; --color-rose-200: #881337; --color-rose-300: #9f1239;
+  --color-rose-400: #be123c; --color-red-300: #991b1b; --color-red-400: #b91c1c;
+}
+html[data-theme='light'][data-accent='teal'] {
+  --color-indigo-200: #0a5c54; --color-indigo-300: #0b6f65; --color-indigo-400: #0d7f74;
+  --color-indigo-500: #0f9488; --color-indigo-600: #0b7a70; --color-indigo-900: #cdf5ef;
+  --color-indigo-950: #e4faf7; --color-purple-900: #d6f7f2;
+}
+html[data-theme='light'][data-accent='indigo'] {
+  --color-indigo-200: #3730a3; --color-indigo-300: #4338ca; --color-indigo-400: #4f46e5;
+  --color-indigo-500: #6366f1; --color-indigo-600: #4f46e5; --color-indigo-900: #e0e7ff;
+  --color-indigo-950: #eef2ff; --color-purple-900: #ede9fe;
+}
+
+/* text-white means "main text" here; keep real white on solid colored buttons/badges */
+html[data-theme='light'] .text-white,
+html[data-theme='light'] .hover\:text-white:hover,
+html[data-theme='light'] .group:hover .group-hover\:text-white { color: var(--color-slate-50); }
+html[data-theme='light'] :is(
+  [class~='bg-indigo-500'], [class~='bg-indigo-600'], [class~='bg-indigo-500/90'],
+  [class~='bg-emerald-500'], [class~='bg-emerald-500/90'], [class~='bg-amber-500/90'], [class~='bg-rose-500/90']
+).text-white { color: #fff; }
+
+/* ---------- Typography ---------- */
+h1, h2, h3 { font-family: var(--font-display); letter-spacing: -0.01em; }
+
+/* ---------- Native-app feel ---------- */
+html { -webkit-tap-highlight-color: transparent; overscroll-behavior-y: none; }
+button, [role='button'], select, label { touch-action: manipulation; }
+button { user-select: none; }
+:focus-visible { outline: 2px solid var(--color-indigo-400); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after {
+    animation-duration: 0.01ms !important; animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important; scroll-behavior: auto !important;
+  }
+}
+
+/* ---------- Scrollbars follow the theme ---------- */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--color-slate-900); }
+::-webkit-scrollbar-thumb { background: var(--color-slate-700); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-slate-600); }
+
+/* ---------- Android edge-to-edge: keep content clear of system bars ---------- */
+header { padding-top: env(safe-area-inset-top, 0px); }
+body { padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); }
+.bottom-nav { padding-bottom: env(safe-area-inset-bottom, 0px); }
+main { padding-bottom: calc(6rem + env(safe-area-inset-bottom, 0px)); }

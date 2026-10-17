@@ -4,11 +4,68 @@ import {
   Search, Check, Plus, Minus, RefreshCw, AlertTriangle, Info,
   Settings, ChevronDown, CheckCircle, Flame, Star,
   X, ExternalLink, Heart, Film, Trash2, Users, TrendingUp,
-  Filter, ArrowUpDown, Layers, Compass
+  Filter, ArrowUpDown, Layers, Compass, MoreVertical, SlidersHorizontal
 } from 'lucide-react';
+import DataPanel from './DataPanel.jsx';
+import {
+  loadWatchlist, saveWatchlist, snapshotPrevious, getLastBackupAt, requestPersistence, getPref, setPref
+} from './storage.js';
+import Stats from './Stats.jsx';
+import { useToast } from './Toast.jsx';
+import { Shimmer, CoverGridSkeleton, RowsSkeleton } from './Skeleton.jsx';
+import { App as CapApp } from '@capacitor/app';
+import { scheduleAiring, ensurePermission, onWatchedAction } from './notifications.js';
 
-const STORAGE_KEY = 'anitrack-watchlist';
 const ANILIST_API = 'https://graphql.anilist.co';
+
+const a11yClick = (fn) => ({
+  role: 'button',
+  tabIndex: 0,
+  onClick: fn,
+  onKeyDown: (e) => {
+    if (e.target !== e.currentTarget) return;
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fn(e); }
+  }
+});
+
+const NAV = [
+  { id: 'dashboard', label: 'Home', Icon: TrendingUp },
+  { id: 'watchlist', label: 'List', Icon: Film },
+  { id: 'seasonal', label: 'Seasonal', Icon: Compass },
+  { id: 'search', label: 'Search', Icon: Search },
+  { id: 'stats', label: 'Stats', Icon: Layers }
+];
+
+const STATUS_LABEL = { WATCHING: 'Watching', PLAN_TO_WATCH: 'Plan to watch', COMPLETED: 'Completed', PAUSED: 'On hold', DROPPED: 'Dropped' };
+
+// Swipe right on a row/card = +1 episode. Vertical scrolling is left alone.
+const useSwipeRight = (onSwipe) => {
+  const start = useRef(null);
+  return {
+    style: { touchAction: 'pan-y' },
+    onTouchStart: (e) => { const t = e.touches[0]; start.current = { x: t.clientX, y: t.clientY }; },
+    onTouchEnd: (e) => {
+      const s0 = start.current; start.current = null;
+      if (!s0) return;
+      const t = e.changedTouches[0];
+      const dx = t.clientX - s0.x, dy = t.clientY - s0.y;
+      if (dx > 70 && Math.abs(dx) > Math.abs(dy) * 2) onSwipe();
+    }
+  };
+};
+
+const bumpInfo = (item, updateProgress) => {
+  let max = Infinity;
+  if (item.mediaStatus === 'RELEASING' && item.airedEpisodes != null) max = item.airedEpisodes;
+  else if (item.totalEpisodes != null) max = item.totalEpisodes;
+  const canBump = item.progress < max;
+  return {
+    canBump,
+    behind: item.airedEpisodes != null ? Math.max(0, item.airedEpisodes - item.progress) : 0,
+    pct: item.totalEpisodes ? Math.min(100, (item.progress / item.totalEpisodes) * 100) : (item.progress ? 25 : 0),
+    bump: () => { if (canBump) { updateProgress(item.id, item.progress + 1); navigator.vibrate?.(15); } }
+  };
+};
 
 const getLocalUnixNow = () => Math.floor(Date.now() / 1000);
 
@@ -46,17 +103,50 @@ const formatLocal = (unix, options) => {
   return new Intl.DateTimeFormat(undefined, options).format(new Date(unix * 1000));
 };
 
+const CACHE_KEY = 'anitrack-api-cache-v1';
+const CACHE_MAX = 25;
+const hashStr = (str) => {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0;
+  return String(h >>> 0);
+};
+const readCache = () => {
+  try { return JSON.parse(localStorage.getItem(CACHE_KEY)) || {}; } catch { return {}; }
+};
+const writeCache = (key, data) => {
+  try {
+    const c = readCache();
+    c[key] = { t: Date.now(), data };
+    Object.keys(c).sort((a, b) => c[b].t - c[a].t).slice(CACHE_MAX).forEach((k) => delete c[k]);
+    localStorage.setItem(CACHE_KEY, JSON.stringify(c));
+  } catch { /* quota: skip caching */ }
+};
+
+// Network first; if offline, fall back to the last successful response for the same request.
 const fetchGraphQL = async (query, variables, signal) => {
-  const res = await fetch(ANILIST_API, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-    body: JSON.stringify({ query, variables }),
-    signal
-  });
+  const cacheKey = hashStr(query + JSON.stringify(variables || {}));
+  let res;
+  try {
+    res = await fetch(ANILIST_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ query, variables }),
+      signal
+    });
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    const hit = readCache()[cacheKey];
+    if (hit) {
+      window.dispatchEvent(new CustomEvent('anitrack:offline', { detail: hit.t }));
+      return hit.data;
+    }
+    throw e;
+  }
   if (res.status === 429) throw new Error('rate_limit');
   if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
   const json = await res.json();
   if (json.errors) throw new Error(json.errors[0].message);
+  writeCache(cacheKey, json.data);
   return json.data;
 };
 
@@ -80,8 +170,10 @@ const useTicker = () => useContext(TickerContext);
 const TickerProvider = ({ children }) => {
   const [ticker, setTicker] = useState(Date.now());
   useEffect(() => {
-    const id = setInterval(() => setTicker(Date.now()), 1000);
-    return () => clearInterval(id);
+    const id = setInterval(() => { if (!document.hidden) setTicker(Date.now()); }, 30000);
+    const onVisible = () => { if (!document.hidden) setTicker(Date.now()); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVisible); };
   }, []);
 
   return (
@@ -142,24 +234,37 @@ const migrateWatchlistItem = (item) => {
 };
 
 function useWatchlist() {
-  const [watchlist, setWatchlist] = useState(() => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY) || localStorage.getItem('pht-anime-watchlist');
-      if (!stored) return [];
-      const parsed = JSON.parse(stored);
-      if (!Array.isArray(parsed)) return [];
-      return parsed.map(migrateWatchlistItem);
-    } catch (e) {
-      console.error('Watchlist parse error:', e);
-      return [];
-    }
-  });
+  const [watchlist, setWatchlist] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [notice, setNotice] = useState(null);
+  const [saveError, setSaveError] = useState(null);
+  const [lastBackupAt, setLastBackupAt] = useState(null);
+
+  // Hydrate from durable storage once. Nothing is written until this finishes,
+  // so the empty first render can never overwrite saved data.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      await requestPersistence();
+      const { list, notice: n } = await loadWatchlist();
+      const backupAt = await getLastBackupAt();
+      if (cancelled) return;
+      setWatchlist(list.map(migrateWatchlistItem));
+      setNotice(n);
+      setLastBackupAt(backupAt);
+      setLoaded(true);
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   const watchlistRef = useRef(watchlist);
   useEffect(() => {
     watchlistRef.current = watchlist;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(watchlist));
-  }, [watchlist]);
+    if (!loaded) return;
+    saveWatchlist(watchlist)
+      .then(() => setSaveError(null))
+      .catch((e) => setSaveError(e.message));
+  }, [watchlist, loaded]);
 
   const add = useCallback((anime, initialProgress = 0) => {
     setWatchlist(prev => {
@@ -323,6 +428,47 @@ function useWatchlist() {
     setWatchlist(prev => prev.map(a => a.id === id ? { ...a, favorite: !a.favorite } : a));
   }, []);
 
+  const upsert = useCallback((item) => {
+    setWatchlist(prev => prev.some(a => a.id === item.id) ? prev.map(a => a.id === item.id ? item : a) : [...prev, item]);
+  }, []);
+
+  const replaceAll = useCallback(async (items) => {
+    await snapshotPrevious(watchlistRef.current);
+    const next = items.map(migrateWatchlistItem);
+    watchlistRef.current = next;
+    setWatchlist(next);
+    return `Restored ${next.length} anime.`;
+  }, []);
+
+  const mergeIn = useCallback(async (items) => {
+    await snapshotPrevious(watchlistRef.current);
+    const byId = new Map(watchlistRef.current.map(a => [a.id, a]));
+    let added = 0, updated = 0;
+    for (const inc of items.map(migrateWatchlistItem)) {
+      const ex = byId.get(inc.id);
+      if (!ex) { byId.set(inc.id, inc); added++; }
+      else if (inc.progress > ex.progress) {
+        byId.set(inc.id, {
+          ...ex,
+          progress: inc.progress,
+          status: inc.status,
+          previousProgress: inc.previousProgress,
+          score: ex.score ?? inc.score,
+          notes: ex.notes || inc.notes,
+          favorite: ex.favorite || inc.favorite
+        });
+        updated++;
+      }
+    }
+    const next = [...byId.values()];
+    watchlistRef.current = next;
+    setWatchlist(next);
+    return `Added ${added}, updated ${updated}.`;
+  }, []);
+
+  const refreshLastBackup = useCallback(async () => setLastBackupAt(await getLastBackupAt()), []);
+  const dismissNotice = useCallback(() => setNotice(null), []);
+
   const sync = useCallback(async () => {
     const currentList = watchlistRef.current;
     if (currentList.length === 0) return { success: true };
@@ -389,9 +535,11 @@ function useWatchlist() {
     }
   }, []);
 
-  return { 
-    watchlist, add, remove, updateStatus, setStatusAndAdd, updateProgress, 
-    setScore, setNotes, toggleFavorite, sync 
+  return {
+    watchlist, loaded, notice, saveError, lastBackupAt,
+    add, remove, updateStatus, setStatusAndAdd, updateProgress,
+    setScore, setNotes, toggleFavorite, sync,
+    replaceAll, mergeIn, upsert, refreshLastBackup, dismissNotice
   };
 }
 
@@ -524,8 +672,8 @@ const ProgressRing = ({ progress, total, size = 40, strokeWidth = 3 }) => {
   
   return (
     <svg width={size} height={size} className="transform -rotate-90">
-      <circle cx={size/2} cy={size/2} r={r} fill="transparent" stroke="#334155" strokeWidth={strokeWidth} />
-      <circle cx={size/2} cy={size/2} r={r} fill="transparent" stroke="#818cf8" strokeWidth={strokeWidth}
+      <circle cx={size/2} cy={size/2} r={r} fill="transparent" style={{ stroke: 'var(--color-slate-700)' }} strokeWidth={strokeWidth} />
+      <circle cx={size/2} cy={size/2} r={r} fill="transparent" style={{ stroke: 'var(--color-indigo-400)' }} strokeWidth={strokeWidth}
         strokeDasharray={circ} strokeDashoffset={circ * (1 - percent)}
         className="transition-all duration-500 ease-out" />
     </svg>
@@ -627,8 +775,8 @@ const CalendarView = ({ watchlist, updateProgress, updateStatus, add, openAnime 
   const navToday = () => setSelectedUnix(getLocalStartOfDayUnix(getLocalUnixNow()));
 
   const renderDaily = () => {
-    if (loading) return <div className="p-8 text-center text-slate-400 animate-pulse">Loading schedule...</div>;
-    if (schedules.length === 0) return <div className="p-8 text-center text-slate-400 bg-slate-800/20 rounded-xl">No anime releases scheduled for this day.</div>;
+    if (loading) return <RowsSkeleton n={4} />;
+    if (schedules.length === 0) return <div className="p-8 text-center text-slate-400 bg-slate-800/20 rounded-xl">Quiet day. Nothing airing.</div>;
     
     return (
       <div className="bg-slate-800/30 rounded-2xl p-2">
@@ -652,7 +800,7 @@ const CalendarView = ({ watchlist, updateProgress, updateStatus, add, openAnime 
   };
 
   const renderWeekly = () => {
-    if (loading) return <div className="p-8 text-center text-slate-400 animate-pulse">Loading weekly schedule...</div>;
+    if (loading) return <RowsSkeleton n={5} />;
 
     return (
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-7 gap-4">
@@ -695,7 +843,7 @@ const CalendarView = ({ watchlist, updateProgress, updateStatus, add, openAnime 
   };
 
   const renderMonthly = () => {
-    if (loading) return <div className="p-8 text-center text-slate-400 animate-pulse">Loading monthly grid...</div>;
+    if (loading) return <Shimmer className="h-72 w-full" />;
 
     const daysInMonth = getLocalDaysInMonth(startUnix);
     const firstDayOfWeek = getDayOfWeekLocal(startUnix);
@@ -787,7 +935,7 @@ const CalendarView = ({ watchlist, updateProgress, updateStatus, add, openAnime 
           <div className="flex items-center gap-3">
             <AlertTriangle size={20} className="flex-shrink-0" />
             <span className="text-sm font-medium">
-              {error === 'rate_limit' ? 'Rate limited by AniList API. Please wait a moment.' : error}
+              {error === 'rate_limit' ? 'AniList asked us to slow down. Try again in a minute.' : error}
             </span>
           </div>
           <button onClick={retry} className="px-3 py-1.5 bg-red-500/20 hover:bg-red-500/30 text-red-300 rounded-lg text-xs font-bold transition-colors flex items-center gap-1.5 flex-shrink-0">
@@ -821,35 +969,19 @@ const CalendarView = ({ watchlist, updateProgress, updateStatus, add, openAnime 
   );
 };
 
-const DashboardStat = ({ icon: Icon, label, value, colorScheme, onClick }) => {
-  const schemes = {
-    rose: 'bg-rose-500/10 text-rose-400 border-rose-500/20 hover:border-rose-500/50',
-    emerald: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20 hover:border-emerald-500/50',
-    amber: 'bg-amber-500/10 text-amber-400 border-amber-500/20 hover:border-amber-500/50',
-    indigo: 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20 hover:border-indigo-500/50'
-  };
-
-  const schemeClass = schemes[colorScheme] || schemes.indigo;
-
-  return (
-    <div onClick={onClick} className={`p-5 rounded-2xl border bg-slate-800/50 flex items-center gap-4 cursor-pointer transition-all transform hover:scale-[1.02] ${schemeClass}`}>
-      <div className={`p-3 rounded-xl ${schemeClass}`}>
-        <Icon size={24} />
-      </div>
-      <div>
-        <div className="text-slate-400 text-sm font-medium">{label}</div>
-        <div className="text-2xl font-bold text-white">{value}</div>
-      </div>
-    </div>
-  );
-};
-
 const Dashboard = ({ watchlist, updateProgress, updateStatus, add, sync, openAnime, setViewAndFilter }) => {
   const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState(null);
 
   const handleSync = async () => {
     setSyncing(true);
-    await sync();
+    setSyncError(null);
+    const res = await sync();
+    if (res && !res.success) {
+      setSyncError(res.error === 'rate_limit'
+        ? 'AniList asked us to slow down. Try again in a minute.'
+        : 'Couldn\'t reach AniList. Check your connection.');
+    }
     setSyncing(false);
   };
 
@@ -863,57 +995,62 @@ const Dashboard = ({ watchlist, updateProgress, updateStatus, add, sync, openAni
     return acc;
   }, 0);
   
-  const continueWatching = watching.filter(a => a.airedEpisodes !== null && a.airedEpisodes !== undefined && a.progress < a.airedEpisodes);
+  const ready = watching
+    .filter(a => a.airedEpisodes != null && a.progress < a.airedEpisodes)
+    .sort((a, b) => (a.airedEpisodes - a.progress) - (b.airedEpisodes - b.progress));
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
       <div className="flex justify-between items-center">
         <h1 className="text-3xl font-bold text-white">Dashboard</h1>
+        <div className="flex items-center gap-3">
+          {syncError && <span role="alert" className="text-xs text-rose-400">{syncError}</span>}
         <button onClick={handleSync} disabled={syncing} className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-sm font-medium transition-colors">
           <RefreshCw size={16} className={syncing ? 'animate-spin text-indigo-400' : ''} />
           {syncing ? 'Syncing...' : 'Sync Data'}
         </button>
-      </div>
-
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <DashboardStat icon={Flame} label="Watching" value={watching.length} colorScheme="rose" onClick={() => setViewAndFilter('WATCHING')} />
-        <DashboardStat icon={CheckCircle} label="Completed" value={completed.length} colorScheme="emerald" onClick={() => setViewAndFilter('COMPLETED')} />
-        <DashboardStat icon={Star} label="Eps Watched" value={epsWatched} colorScheme="amber" onClick={() => setViewAndFilter('ALL')} />
-        <DashboardStat icon={AlertTriangle} label="Eps Behind" value={epsBehind} colorScheme="indigo" onClick={() => setViewAndFilter('WATCHING')} />
-      </div>
-
-      {continueWatching.length > 0 && (
-        <div className="bg-slate-800/30 border border-slate-700/50 p-6 rounded-2xl">
-          <h2 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
-            <PlayCircleIcon size={20} className="text-indigo-400" /> Continue Watching
-          </h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {continueWatching.slice(0, 6).map(item => (
-              <div 
-                key={item.id} 
-                onClick={() => openAnime(item.id)}
-                className="flex items-center gap-4 bg-slate-800/80 p-3 rounded-xl border border-slate-700 hover:border-indigo-500/50 transition-colors cursor-pointer"
-              >
-                <img src={item.coverImage?.large} alt="" referrerPolicy="no-referrer" className="w-12 h-16 rounded object-cover flex-shrink-0" />
-                <div className="flex-1 min-w-0">
-                  <h4 className="font-semibold text-slate-200 text-sm truncate hover:text-indigo-400 transition-colors">{item.title?.english || item.title?.romaji}</h4>
-                  <div className="text-xs text-slate-400 mt-1">Ep {item.progress} / {item.totalEpisodes || '?'}</div>
-                  <div className="text-xs text-indigo-400 mt-0.5">{item.airedEpisodes - item.progress} eps behind</div>
-                </div>
-                <button 
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    updateProgress(item.id, item.progress + 1);
-                  }}
-                  className="w-10 h-10 rounded-full bg-indigo-500/10 hover:bg-indigo-500 hover:text-white text-indigo-400 flex flex-shrink-0 items-center justify-center transition-all"
-                  title="Mark next watched"
-                >
-                  <Plus size={20} />
-                </button>
-              </div>
-            ))}
-          </div>
         </div>
+      </div>
+
+      <div className="flex flex-wrap gap-x-10 gap-y-4">
+        {[
+          { label: 'Watching', value: watching.length, go: () => setViewAndFilter('WATCHING') },
+          { label: 'Completed', value: completed.length, go: () => setViewAndFilter('COMPLETED') },
+          { label: 'Episodes watched', value: epsWatched, go: () => setViewAndFilter('ALL', 'progress') },
+          { label: 'Behind', value: epsBehind, go: () => setViewAndFilter('BEHIND', 'behind') }
+        ].map(t => (
+          <button key={t.label} onClick={t.go} className="text-left">
+            <div className="text-3xl font-bold text-white font-display">{t.value}</div>
+            <div className="text-xs text-slate-400">{t.label}</div>
+          </button>
+        ))}
+      </div>
+
+      {watching.length > 0 && (
+        <section>
+          <h2 className="text-xl font-bold text-white mb-3">Ready to watch</h2>
+          {ready.length === 0 ? (
+            <p className="text-sm text-slate-400">You're all caught up.</p>
+          ) : (
+            <div className="flex gap-3 overflow-x-auto pb-2 scrollbar-hide">
+              {ready.map(item => (
+                <div key={item.id} {...a11yClick(() => openAnime(item.id))} className="w-28 shrink-0 cursor-pointer">
+                  <div className="relative aspect-[3/4] rounded-xl overflow-hidden bg-slate-800">
+                    <img src={item.coverImage?.large} alt="" referrerPolicy="no-referrer" className="w-full h-full object-cover" />
+                    <span className="absolute top-1.5 left-1.5 bg-indigo-500 text-white text-[11px] font-bold px-1.5 py-0.5 rounded-md">+{item.airedEpisodes - item.progress}</span>
+                    <button onClick={(e) => { e.stopPropagation(); updateProgress(item.id, item.progress + 1); }}
+                      aria-label={`Mark episode ${item.progress + 1} watched`}
+                      className="absolute bottom-1.5 right-1.5 w-8 h-8 rounded-full bg-indigo-500 hover:bg-indigo-600 text-white flex items-center justify-center">
+                      <Plus size={16} />
+                    </button>
+                  </div>
+                  <div className="mt-1.5 text-xs font-medium text-slate-200 line-clamp-2">{item.title?.english || item.title?.romaji}</div>
+                  <div className="text-[11px] text-slate-400">Ep {item.progress + 1} ready</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
       )}
 
       <div>
@@ -925,126 +1062,81 @@ const Dashboard = ({ watchlist, updateProgress, updateStatus, add, sync, openAni
 };
 
 const WatchlistCard = ({ item, updateProgress, updateStatus, remove, openAnime }) => {
-  const isAiring = item.mediaStatus === 'RELEASING';
-  const total = item.totalEpisodes;
-  let maxAllowed = Infinity;
-  if (isAiring && item.airedEpisodes !== null && item.airedEpisodes !== undefined) {
-    maxAllowed = item.airedEpisodes;
-  } else if (total !== null && total !== undefined) {
-    maxAllowed = total;
-  }
-  
-  const nextEpNum = (item.airedEpisodes !== null && item.airedEpisodes !== undefined ? item.airedEpisodes : item.progress) + 1;
-  const showNextEp = isAiring && item.nextEpisodeAt && nextEpNum > 0;
+  const [menu, setMenu] = useState(false);
+  const { canBump, behind, pct, bump } = bumpInfo(item, updateProgress);
+  const swipe = useSwipeRight(bump);
+  const dim = item.status === 'DROPPED' || item.status === 'PAUSED';
+  const stop = (fn) => (e) => { e.stopPropagation(); fn(); };
+  const nextEp = item.mediaStatus === 'RELEASING' && item.nextEpisodeAt ? (item.airedEpisodes ?? item.progress) + 1 : null;
 
   return (
-    <div className="bg-slate-800/50 border border-slate-700 rounded-2xl overflow-hidden hover:border-slate-500 transition-all group flex flex-col">
-      <div className="relative aspect-[3/4] cursor-pointer" onClick={() => openAnime(item.id)}>
-        <img src={item.coverImage?.large} alt="" referrerPolicy="no-referrer" className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-105" />
-        <div className="absolute inset-0 bg-gradient-to-t from-slate-900 via-slate-900/40 to-transparent" />
-        
-        <div className="absolute top-2 left-2 flex items-center gap-1.5">
-          {item.score && (
-            <span className="bg-amber-500/90 text-slate-950 font-extrabold text-[11px] px-2 py-0.5 rounded-md shadow-md flex items-center gap-0.5">
-              <Star size={12} className="fill-slate-950" /> {item.score}
-            </span>
-          )}
-          {item.favorite && (
-            <span className="bg-rose-500/90 text-white p-1 rounded-md shadow-md">
-              <Heart size={12} className="fill-white" />
-            </span>
-          )}
-        </div>
+    <div {...swipe} {...a11yClick(() => openAnime(item.id))}
+      className={`group relative aspect-[3/4] rounded-xl overflow-hidden bg-slate-800 cursor-pointer ${dim ? 'opacity-60' : ''}`}>
+      <img src={item.coverImage?.large} alt="" referrerPolicy="no-referrer" className="w-full h-full object-cover" />
+      <div className="absolute inset-0 bg-gradient-to-t from-slate-900 via-slate-900/30 to-transparent" />
 
-        <div className="absolute top-2 right-2">
-          <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md shadow-md uppercase ${isAiring ? 'bg-indigo-500/90 text-white' : 'bg-slate-800/90 text-slate-300 border border-slate-700'}`}>
-            {isAiring ? 'Airing' : 'Finished'}
-          </span>
+      <div className="absolute top-2 left-2 flex items-center gap-1.5">
+        {item.score && <span className="bg-amber-500/90 text-slate-950 font-bold text-[11px] px-1.5 py-0.5 rounded-md">{item.score}</span>}
+        {item.favorite && <Heart size={14} className="fill-rose-500 text-rose-500" />}
+      </div>
+      <button onClick={stop(() => setMenu(m => !m))} aria-label="More options"
+        className="absolute top-1.5 right-1.5 p-1.5 rounded-full bg-slate-900/60 text-white"><MoreVertical size={16} /></button>
+      {menu && (
+        <div onClick={(e) => e.stopPropagation()} className="absolute top-10 right-2 z-10 w-40 rounded-lg bg-slate-800 border border-slate-700 shadow-xl py-1 text-sm">
+          {Object.entries(STATUS_LABEL).map(([k, l]) => (
+            <button key={k} onClick={stop(() => { updateStatus(item.id, k); setMenu(false); })}
+              className={`block w-full text-left px-3 py-1.5 hover:bg-slate-700 ${item.status === k ? 'text-indigo-400 font-semibold' : 'text-slate-200'}`}>{l}</button>
+          ))}
+          <button onClick={stop(() => { remove(item.id); setMenu(false); })} className="block w-full text-left px-3 py-1.5 border-t border-slate-700 text-slate-400 hover:bg-slate-700">Remove</button>
         </div>
+      )}
 
-        <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between gap-3" onClick={e => e.stopPropagation()}>
-          <div className="flex items-center gap-2 flex-1">
-            <ProgressRing progress={item.progress} total={total} size={36} strokeWidth={4} />
-            <div>
-              <div className="text-white font-bold leading-none">Ep {item.progress} <span className="text-slate-300 text-sm font-normal">/ {total || '?'}</span></div>
-              {total && total > item.progress && <div className="text-xs text-slate-300 mt-1">{total - item.progress} left</div>}
-            </div>
-          </div>
-          
-          <div className="flex flex-col gap-1">
-            <button 
-              onClick={() => updateProgress(item.id, item.progress + 1)} 
-              disabled={item.progress >= maxAllowed}
-              className="bg-indigo-500 hover:bg-indigo-600 disabled:opacity-50 disabled:bg-slate-600 text-white p-1.5 rounded-lg transition-colors"
-            >
-              <Plus size={16} />
-            </button>
-            <button 
-              onClick={() => updateProgress(item.id, item.progress - 1)} 
-              disabled={item.progress === 0}
-              className="bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-white p-1.5 rounded-lg transition-colors"
-            >
-              <Minus size={16} />
-            </button>
-          </div>
+      <div className="absolute bottom-2.5 left-2.5 right-2.5 pr-10">
+        <h3 className="text-white font-semibold text-sm leading-tight line-clamp-2">{item.title?.english || item.title?.romaji}</h3>
+        <div className="text-xs text-slate-300 mt-1">
+          Ep {item.progress}/{item.totalEpisodes || '?'}
+          {behind > 0 && <span className="text-indigo-400"> · {behind} new</span>}
+          {behind === 0 && nextEp && <span> · Ep {nextEp} in <CountdownLabel unixTarget={item.nextEpisodeAt} /></span>}
         </div>
       </div>
-      
-      <div className="p-4 flex flex-col flex-1">
-        <h3 
-          onClick={() => openAnime(item.id)}
-          className="font-bold text-slate-100 line-clamp-1 mb-2 cursor-pointer hover:text-indigo-400 transition-colors" 
-          title={item.title?.english || item.title?.romaji}
-        >
-          {item.title?.english || item.title?.romaji}
-        </h3>
-        
-        {isAiring && (
-          <div className="bg-slate-900/50 rounded-lg p-2.5 mt-auto text-xs space-y-1.5">
-            <div className="flex items-center justify-between">
-              <span className="text-slate-400">Status</span>
-              <span className={item.airedEpisodes !== null && item.progress < item.airedEpisodes ? "text-amber-400 font-medium" : "text-emerald-400 font-medium"}>
-                {item.airedEpisodes !== null && item.progress < item.airedEpisodes ? `${item.airedEpisodes - item.progress} eps behind` : 'Caught up'}
-              </span>
-            </div>
-            {showNextEp && (
-              <div className="text-indigo-300 font-medium border-t border-slate-700/50 pt-1.5 mt-1.5">
-                Next: Ep {nextEpNum} in <CountdownLabel unixTarget={item.nextEpisodeAt} />
-              </div>
-            )}
-          </div>
-        )}
-        
-        <div className="flex flex-col xl:flex-row justify-between items-stretch xl:items-center mt-3 pt-3 border-t border-slate-700 gap-2">
-          <select 
-            value={item.status} 
-            onChange={(e) => updateStatus(item.id, e.target.value)}
-            className="bg-slate-900 text-xs text-slate-300 rounded px-2 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 w-full xl:w-auto cursor-pointer"
-          >
-            <option value="WATCHING">Watching</option>
-            <option value="PLAN_TO_WATCH">Plan to Watch</option>
-            <option value="COMPLETED">Completed</option>
-            <option value="PAUSED">On Hold</option>
-            <option value="DROPPED">Dropped</option>
-          </select>
-          <button onClick={() => remove(item.id)} className="text-slate-500 hover:text-red-400 text-xs transition-colors text-left xl:text-right py-1">Remove</button>
-        </div>
-      </div>
+      <button onClick={stop(bump)} disabled={!canBump} aria-label={`Mark episode ${item.progress + 1} watched`}
+        className="absolute bottom-3 right-2 w-8 h-8 rounded-full bg-indigo-500 hover:bg-indigo-600 disabled:opacity-30 text-white flex items-center justify-center"><Plus size={16} /></button>
+      <div className="absolute bottom-0 inset-x-0 h-1 bg-slate-700/60"><div className="h-full bg-indigo-500" style={{ width: `${pct}%` }} /></div>
     </div>
   );
 };
 
-const Watchlist = ({ watchlist, updateProgress, updateStatus, remove, openAnime, initialFilter = 'ALL' }) => {
+const WatchlistRow = ({ item, updateProgress, openAnime }) => {
+  const { canBump, behind, bump } = bumpInfo(item, updateProgress);
+  const swipe = useSwipeRight(bump);
+  return (
+    <div {...swipe} {...a11yClick(() => openAnime(item.id))}
+      className={`flex items-center gap-3 py-2 cursor-pointer ${item.status === 'DROPPED' || item.status === 'PAUSED' ? 'opacity-60' : ''}`}>
+      <img src={item.coverImage?.large} alt="" referrerPolicy="no-referrer" className="w-9 h-12 rounded object-cover shrink-0" />
+      <div className="flex-1 min-w-0">
+        <div className="text-sm font-medium text-slate-100 truncate">{item.title?.english || item.title?.romaji}</div>
+        <div className="text-xs text-slate-400">Ep {item.progress}/{item.totalEpisodes || '?'}{behind > 0 && <span className="text-indigo-400"> · {behind} new</span>}</div>
+      </div>
+      <button onClick={(e) => { e.stopPropagation(); bump(); }} disabled={!canBump} aria-label={`Mark episode ${item.progress + 1} watched`}
+        className="w-9 h-9 rounded-full bg-slate-800 hover:bg-indigo-500 hover:text-white disabled:opacity-30 text-indigo-400 flex items-center justify-center shrink-0"><Plus size={16} /></button>
+    </div>
+  );
+};
+
+const Watchlist = ({ watchlist, updateProgress, updateStatus, remove, openAnime, initialFilter = 'ALL', initialSort = 'title', layout = 'grid' }) => {
   const [filter, setFilter] = useState(initialFilter);
   const [search, setSearch] = useState('');
-  const [sortBy, setSortBy] = useState('title');
+  const [sortBy, setSortBy] = useState(initialSort);
 
   useEffect(() => {
     setFilter(initialFilter);
-  }, [initialFilter]);
+    setSortBy(initialSort);
+  }, [initialFilter, initialSort]);
 
   const filteredAndSorted = useMemo(() => {
-    let result = filter === 'ALL' ? watchlist : watchlist.filter(a => a.status === filter);
+    let result = filter === 'ALL' ? watchlist
+      : filter === 'BEHIND' ? watchlist.filter(a => a.status === 'WATCHING' && a.airedEpisodes != null && a.progress < a.airedEpisodes)
+      : watchlist.filter(a => a.status === filter);
     
     if (search.trim()) {
       const query = search.toLowerCase();
@@ -1060,6 +1152,8 @@ const Watchlist = ({ watchlist, updateProgress, updateStatus, remove, openAnime,
         return b.progress - a.progress;
       } else if (sortBy === 'score') {
         return (b.score || 0) - (a.score || 0);
+      } else if (sortBy === 'behind') {
+        return ((b.airedEpisodes ?? 0) - b.progress) - ((a.airedEpisodes ?? 0) - a.progress);
       } else if (sortBy === 'favorite') {
         return (b.favorite ? 1 : 0) - (a.favorite ? 1 : 0);
       }
@@ -1094,6 +1188,7 @@ const Watchlist = ({ watchlist, updateProgress, updateStatus, remove, openAnime,
               <option value="title" className="bg-slate-800">Sort: Title</option>
               <option value="progress" className="bg-slate-800">Sort: Progress</option>
               <option value="score" className="bg-slate-800">Sort: Score</option>
+              <option value="behind" className="bg-slate-800">Sort: Most behind</option>
               <option value="favorite" className="bg-slate-800">Sort: Favorites</option>
             </select>
           </div>
@@ -1104,6 +1199,7 @@ const Watchlist = ({ watchlist, updateProgress, updateStatus, remove, openAnime,
         {[
           { key: 'ALL', label: 'All' },
           { key: 'WATCHING', label: 'Watching' },
+          { key: 'BEHIND', label: 'Behind' },
           { key: 'PLAN_TO_WATCH', label: 'Plan to Watch' },
           { key: 'COMPLETED', label: 'Completed' },
           { key: 'PAUSED', label: 'On Hold' },
@@ -1117,11 +1213,24 @@ const Watchlist = ({ watchlist, updateProgress, updateStatus, remove, openAnime,
       </div>
 
       {filteredAndSorted.length === 0 ? (
-        <div className="text-center py-20 text-slate-400 bg-slate-800/30 rounded-2xl border border-slate-800">
-          No anime found matching your filters.
+        <div className="text-center py-16 text-slate-400">
+          {watchlist.length === 0 ? (
+            <p>Nothing here yet. Find your first show in Search.</p>
+          ) : (
+            <>
+              <p>No matches.</p>
+              <button onClick={() => { setFilter('ALL'); setSearch(''); }} className="mt-3 text-indigo-400 underline text-sm">Show everything</button>
+            </>
+          )}
+        </div>
+      ) : layout === 'compact' ? (
+        <div className="divide-y divide-slate-800">
+          {filteredAndSorted.map(item => (
+            <WatchlistRow key={item.id} item={item} updateProgress={updateProgress} openAnime={openAnime} />
+          ))}
         </div>
       ) : (
-        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4 lg:gap-6">
+        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3 lg:gap-4">
           {filteredAndSorted.map(item => (
             <WatchlistCard key={item.id} item={item} updateProgress={updateProgress} updateStatus={updateStatus} remove={remove} openAnime={openAnime} />
           ))}
@@ -1205,7 +1314,7 @@ const Seasonal = ({ watchlist, add, openAnime }) => {
           return (
             <div 
               key={item.id} 
-              onClick={() => openAnime(item.id)}
+              {...a11yClick(() => openAnime(item.id))}
               className="group relative rounded-xl overflow-hidden bg-slate-800 aspect-[3/4] cursor-pointer"
             >
               <img src={item.coverImage?.large} alt="" referrerPolicy="no-referrer" className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110" />
@@ -1233,13 +1342,17 @@ const Seasonal = ({ watchlist, add, openAnime }) => {
       {hasNext && (
         <div className="text-center pt-8 pb-12">
           <button onClick={loadMore} disabled={loading} className="px-8 py-3 bg-slate-800 hover:bg-slate-700 text-white rounded-xl font-bold transition-colors">
-            {loading ? 'Loading...' : 'Load More'}
+            {loading ? 'Fetching…' : 'Show more'}
           </button>
         </div>
       )}
     </div>
   );
 };
+
+const GENRES = ['Action', 'Adventure', 'Comedy', 'Drama', 'Fantasy', 'Horror', 'Mahou Shoujo', 'Mecha', 'Music', 'Mystery', 'Psychological', 'Romance', 'Sci-Fi', 'Slice of Life', 'Sports', 'Supernatural', 'Thriller'];
+const YEARS = Array.from({ length: new Date().getFullYear() + 2 - 1990 }, (_, i) => new Date().getFullYear() + 1 - i);
+const DEFAULT_FILTERS = { format: '', season: '', year: '', genre: '', sort: 'POPULARITY_DESC' };
 
 const SearchAnime = ({ watchlist, add, openAnime }) => {
   const [query, setQuery] = useState('');
@@ -1248,16 +1361,28 @@ const SearchAnime = ({ watchlist, add, openAnime }) => {
   const [page, setPage] = useState(1);
   const [hasNext, setHasNext] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
+  const [filters, setFilters] = useState(DEFAULT_FILTERS);
+  const [showFilters, setShowFilters] = useState(false);
+  const activeCount = ['format', 'season', 'year', 'genre'].filter(k => filters[k]).length;
+  const hasFilters = activeCount > 0;
+
+  const [error, setError] = useState(null);
+  const abortRef = useRef(null);
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   const performSearch = async (searchQuery, p = 1, append = false) => {
-    if (!searchQuery.trim()) return;
+    if (!searchQuery.trim() && !hasFilters) return;
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     setLoading(true);
+    setError(null);
     setHasSearched(true);
     const gqlQuery = `
-      query ($search: String, $page: Int) {
+      query ($search: String, $page: Int, $genre: String, $year: Int, $season: MediaSeason, $format: MediaFormat, $sort: [MediaSort]) {
         Page(page: $page, perPage: 40) {
           pageInfo { hasNextPage }
-          media(search: $search, type: ANIME, sort: POPULARITY_DESC, isAdult: false) {
+          media(search: $search, type: ANIME, genre: $genre, seasonYear: $year, season: $season, format: $format, sort: $sort, isAdult: false) {
             id idMal status episodes
             title { romaji english native }
             coverImage { large extraLarge }
@@ -1267,12 +1392,30 @@ const SearchAnime = ({ watchlist, add, openAnime }) => {
       }
     `;
     try {
-      const data = await fetchGraphQL(gqlQuery, { search: searchQuery, page: p });
-      if (append) setAnime(prev => [...prev, ...data.Page.media]);
-      else setAnime(data.Page.media);
+      const data = await fetchGraphQL(gqlQuery, {
+        search: searchQuery.trim() || null,
+        genre: filters.genre || null,
+        year: filters.year ? Number(filters.year) : null,
+        season: filters.season || null,
+        format: filters.format || null,
+        sort: [filters.sort],
+        page: p
+      }, controller.signal);
+      if (append) {
+        setAnime(prev => {
+          const seen = new Set(prev.map(a => a.id));
+          return [...prev, ...data.Page.media.filter(m => !seen.has(m.id))];
+        });
+      } else {
+        setAnime(data.Page.media);
+      }
       setHasNext(data.Page.pageInfo.hasNextPage);
     } catch (e) {
-      console.error(e);
+      if (e.name === 'AbortError') return;
+      setError(e.message === 'rate_limit'
+        ? 'AniList asked us to slow down. Try again in a minute.'
+        : 'Couldn\'t reach AniList. Check your connection and try again.');
+      if (append) setPage(p - 1); else setAnime([]);
     }
     setLoading(false);
   };
@@ -1302,20 +1445,52 @@ const SearchAnime = ({ watchlist, add, openAnime }) => {
               value={query}
               onChange={e => setQuery(e.target.value)}
               placeholder="Search for anime..."
+              aria-label="Search for anime"
               className="w-full bg-slate-800 text-white rounded-lg pl-10 pr-4 py-2 border border-slate-700 outline-none focus:border-indigo-500"
             />
           </div>
-          <button type="submit" disabled={loading || !query.trim()} className="px-4 py-2 bg-indigo-500 hover:bg-indigo-600 disabled:opacity-50 text-white rounded-lg font-medium transition-colors">
+          <button type="submit" disabled={loading || (!query.trim() && !hasFilters)} className="px-4 py-2 bg-indigo-500 hover:bg-indigo-600 disabled:opacity-50 text-white rounded-lg font-medium transition-colors">
             Search
+          </button>
+          <button type="button" onClick={() => setShowFilters(v => !v)} aria-label="Filters" aria-expanded={showFilters}
+            className={`px-3 py-2 rounded-lg flex items-center gap-1.5 text-sm ${hasFilters ? 'bg-indigo-500/20 text-indigo-400' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'}`}>
+            <SlidersHorizontal size={18} />{hasFilters && <span>{activeCount}</span>}
           </button>
         </form>
       </div>
 
-      {hasSearched && anime.length === 0 && !loading && (
-        <div className="text-center py-20 text-slate-400 bg-slate-800/30 rounded-2xl border border-slate-800">
-          No results found for "{query}".
+      {showFilters && (
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+          {[
+            ['format', 'Format', [['', 'Any format'], ['TV', 'TV'], ['MOVIE', 'Movie'], ['OVA', 'OVA'], ['ONA', 'ONA'], ['SPECIAL', 'Special']]],
+            ['season', 'Season', [['', 'Any season'], ['WINTER', 'Winter'], ['SPRING', 'Spring'], ['SUMMER', 'Summer'], ['FALL', 'Fall']]],
+            ['year', 'Year', [['', 'Any year'], ...YEARS.map(y => [String(y), String(y)])]],
+            ['genre', 'Genre', [['', 'Any genre'], ...GENRES.map(g => [g, g])]],
+            ['sort', 'Sort', [['POPULARITY_DESC', 'Popular'], ['SCORE_DESC', 'Top rated'], ['TRENDING_DESC', 'Trending'], ['START_DATE_DESC', 'Newest'], ['SEARCH_MATCH', 'Best match']]]
+          ].map(([key, label, opts]) => (
+            <select key={key} aria-label={label} value={filters[key]} onChange={e => setFilters(f => ({ ...f, [key]: e.target.value }))}
+              className="bg-slate-800 text-sm text-slate-200 rounded-lg px-3 py-2 border border-slate-700 outline-none focus:border-indigo-500">
+              {opts.map(([v, l]) => <option key={v} value={v} className="bg-slate-800">{l}</option>)}
+            </select>
+          ))}
+          <div className="col-span-2 md:col-span-5 flex gap-2">
+            <button type="button" onClick={() => { setPage(1); performSearch(query, 1, false); }} className="px-4 py-2 bg-indigo-500 hover:bg-indigo-600 text-white rounded-lg text-sm font-medium">Apply</button>
+            <button type="button" onClick={() => setFilters(DEFAULT_FILTERS)} className="px-4 py-2 text-slate-400 hover:text-white text-sm">Clear</button>
+          </div>
         </div>
       )}
+
+      {error && (
+        <div role="alert" className="text-center py-6 text-rose-300 bg-rose-500/10 rounded-2xl border border-rose-500/20">{error}</div>
+      )}
+
+      {hasSearched && anime.length === 0 && !loading && !error && (
+        <div className="text-center py-20 text-slate-400 bg-slate-800/30 rounded-2xl border border-slate-800">
+          Nothing matched. Try fewer words or looser filters.
+        </div>
+      )}
+
+      {loading && anime.length === 0 && <CoverGridSkeleton />}
 
       <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
         {anime.map(item => {
@@ -1323,7 +1498,7 @@ const SearchAnime = ({ watchlist, add, openAnime }) => {
           return (
             <div 
               key={item.id} 
-              onClick={() => openAnime(item.id)}
+              {...a11yClick(() => openAnime(item.id))}
               className="group relative rounded-xl overflow-hidden bg-slate-800 aspect-[3/4] cursor-pointer"
             >
               <img src={item.coverImage?.large} alt="" referrerPolicy="no-referrer" className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110" />
@@ -1351,7 +1526,7 @@ const SearchAnime = ({ watchlist, add, openAnime }) => {
       {hasNext && (
         <div className="text-center pt-8 pb-12">
           <button onClick={loadMore} disabled={loading} className="px-8 py-3 bg-slate-800 hover:bg-slate-700 text-white rounded-xl font-bold transition-colors">
-            {loading ? 'Loading...' : 'Load More'}
+            {loading ? 'Fetching…' : 'Show more'}
           </button>
         </div>
       )}
@@ -1527,7 +1702,7 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
         {error && !data && (
           <div className="p-12 text-center space-y-4">
             <AlertTriangle size={40} className="mx-auto text-red-400" />
-            <h3 className="text-xl font-bold text-white">Error Loading Anime</h3>
+            <h3 className="text-xl font-bold text-white">Couldn't load this one</h3>
             <p className="text-slate-400 text-sm">{error}</p>
             <button onClick={fetchData} className="px-5 py-2 bg-indigo-500 hover:bg-indigo-600 text-white rounded-lg font-medium transition-colors inline-flex items-center gap-2">
               <RefreshCw size={16} /> Retry
@@ -1538,11 +1713,11 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
         {(data || watchItem) && (
           <div className="flex-1 space-y-6 pb-8">
             <div className="relative">
-              <div className="h-44 sm:h-60 w-full overflow-hidden bg-gradient-to-r from-indigo-900/50 via-slate-800 to-purple-900/50 relative">
+              <div className="h-44 sm:h-60 w-full overflow-hidden bg-slate-800 relative">
                 {bannerImg ? (
                   <img src={bannerImg} alt="" referrerPolicy="no-referrer" className="w-full h-full object-cover opacity-60" />
                 ) : (
-                  <div className="w-full h-full bg-gradient-to-tr from-indigo-950 via-slate-900 to-slate-800 opacity-90" />
+                  <div className="w-full h-full bg-slate-900" />
                 )}
                 <div className="absolute inset-0 bg-gradient-to-t from-slate-900 via-slate-900/40 to-transparent" />
               </div>
@@ -1761,6 +1936,20 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
                 )}
               </div>
 
+              {data && (
+                <div className="space-y-2">
+                  <h3 className="font-bold text-white text-base">Where to watch</h3>
+                  {streamingLinks.length > 0 ? (
+                    <div className="flex flex-wrap gap-2">
+                      {streamingLinks.map(l => (
+                        <a key={l.url} href={l.url} target="_blank" rel="noopener noreferrer"
+                          className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-sm text-slate-200">{l.site}</a>
+                      ))}
+                    </div>
+                  ) : <p className="text-sm text-slate-400">No streaming links listed.</p>}
+                </div>
+              )}
+
               {/* Synopsis with normal line heights and compact paragraph spacing */}
               <div className="space-y-2">
                 <h3 className="font-bold text-white text-base">Synopsis</h3>
@@ -1803,6 +1992,7 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
 export default function App() {
   const [currentView, setCurrentView] = useState('dashboard');
   const [watchlistFilter, setWatchlistFilter] = useState('ALL');
+  const [watchlistSort, setWatchlistSort] = useState('title');
   const [selectedAnimeId, setSelectedAnimeId] = useState(null);
   const w = useWatchlist();
 
@@ -1814,28 +2004,124 @@ export default function App() {
     setSelectedAnimeId(null);
   }, []);
 
-  const setViewAndFilter = useCallback((filter) => {
+  const setViewAndFilter = useCallback((filter, sort = 'title') => {
     setWatchlistFilter(filter);
+    setWatchlistSort(sort);
     setCurrentView('watchlist');
   }, []);
 
+  const [showData, setShowData] = useState(false);
+  const [nudgeDismissed, setNudgeDismissed] = useState(false);
+  const [alertsOn, setAlertsOn] = useState(false);
+  const [offlineAt, setOfflineAt] = useState(null);
+
+  useEffect(() => { getPref('alerts', 'false').then((v) => setAlertsOn(v === 'true')); }, []);
+
   useEffect(() => {
+    if (!w.loaded) return;
+    const t = setTimeout(() => {
+      scheduleAiring(w.watchlist, alertsOn).catch((e) => console.error('Alerts failed:', e));
+    }, 1000);
+    return () => clearTimeout(t);
+  }, [w.watchlist, w.loaded, alertsOn]);
+
+  const toggleAlerts = async (on) => {
+    if (on && !(await ensurePermission())) {
+      return 'Notifications are blocked. Allow them for AniTrack in Android settings.';
+    }
+    setAlertsOn(on);
+    await setPref('alerts', on);
+    return null;
+  };
+
+  useEffect(() => {
+    const goOffline = (e) => setOfflineAt(e.detail);
+    const goOnline = () => setOfflineAt(null);
+    window.addEventListener('anitrack:offline', goOffline);
+    window.addEventListener('online', goOnline);
+    return () => {
+      window.removeEventListener('anitrack:offline', goOffline);
+      window.removeEventListener('online', goOnline);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!w.loaded) return;
     w.sync();
     const syncInterval = setInterval(() => w.sync(), 30 * 60 * 1000);
     return () => clearInterval(syncInterval);
-  }, [w.sync]);
+  }, [w.sync, w.loaded]);
+
+  const closeData = () => { setShowData(false); w.refreshLastBackup(); };
+  const backupDue = w.loaded && !nudgeDismissed && w.watchlist.length >= 5 &&
+    (!w.lastBackupAt || Date.now() - w.lastBackupAt > 14 * 24 * 3600 * 1000);
+
+  // Android back button: close panels first, then go Home, and only then exit.
+  const navRef = useRef(() => {});
+  navRef.current = () => {
+    if (showData) closeData();
+    else if (selectedAnimeId) closeAnime();
+    else if (currentView !== 'dashboard') setCurrentView('dashboard');
+    else CapApp.exitApp();
+  };
+  useEffect(() => {
+    let handle;
+    CapApp.addListener('backButton', () => navRef.current()).then((h) => { handle = h; }).catch(() => {});
+    return () => { handle?.remove(); };
+  }, []);
+
+  const toast = useToast();
+  const titleOf = (a) => a?.title?.english || a?.title?.romaji || 'That show';
+  const uProgress = (id, n) => {
+    const before = w.watchlist.find(a => a.id === id);
+    w.updateProgress(id, n);
+    if (before && n !== before.progress) {
+      toast(`${titleOf(before)}: ${n > before.progress ? `episode ${n} watched` : `back to episode ${n}`}`, () => w.upsert(before));
+    }
+  };
+  const uRemove = (id) => {
+    const before = w.watchlist.find(a => a.id === id);
+    w.remove(id);
+    if (before) toast(`Removed ${titleOf(before)}`, () => w.upsert(before));
+  };
+
+  const [layout, setLayout] = useState('grid');
+  useEffect(() => { getPref('layout', 'grid').then(v => setLayout(v === 'compact' ? 'compact' : 'grid')); }, []);
+  const changeLayout = (v) => { setLayout(v); setPref('layout', v); };
+
+  // "Mark watched" button on an episode alert. May arrive before the list has loaded.
+  const pendingMarks = useRef([]);
+  const applyMark = (id, ep) => {
+    const it = w.watchlist.find(a => a.id === id);
+    if (!it || ep <= it.progress) return;
+    w.upsert({ ...it, airedEpisodes: Math.max(it.airedEpisodes ?? 0, ep) });
+    w.updateProgress(id, ep);
+    toast(`${titleOf(it)}: episode ${ep} watched`, () => w.upsert(it));
+  };
+  const markRef = useRef(applyMark);
+  markRef.current = (id, ep) => { if (w.loaded) applyMark(id, ep); else pendingMarks.current.push([id, ep]); };
+  useEffect(() => {
+    let off;
+    onWatchedAction((id, ep) => markRef.current(id, ep)).then(f => { off = f; });
+    return () => off?.();
+  }, []);
+  useEffect(() => {
+    if (!w.loaded || !pendingMarks.current.length) return;
+    pendingMarks.current.splice(0).forEach(([id, ep]) => applyMark(id, ep));
+  }, [w.loaded]);
 
   const views = {
-    dashboard: <Dashboard watchlist={w.watchlist} updateProgress={w.updateProgress} updateStatus={w.updateStatus} add={w.add} sync={w.sync} openAnime={openAnime} setViewAndFilter={setViewAndFilter} />,
-    watchlist: <Watchlist watchlist={w.watchlist} updateProgress={w.updateProgress} updateStatus={w.updateStatus} remove={w.remove} openAnime={openAnime} initialFilter={watchlistFilter} />,
+    dashboard: <Dashboard watchlist={w.watchlist} updateProgress={uProgress} updateStatus={w.updateStatus} add={w.add} sync={w.sync} openAnime={openAnime} setViewAndFilter={setViewAndFilter} />,
+    watchlist: <Watchlist watchlist={w.watchlist} updateProgress={uProgress} updateStatus={w.updateStatus} remove={uRemove} openAnime={openAnime} initialFilter={watchlistFilter} initialSort={watchlistSort} layout={layout} />,
     seasonal: <Seasonal watchlist={w.watchlist} add={w.add} openAnime={openAnime} />,
-    search: <SearchAnime watchlist={w.watchlist} add={w.add} openAnime={openAnime} />
+    search: <SearchAnime watchlist={w.watchlist} add={w.add} openAnime={openAnime} />,
+    stats: <Stats watchlist={w.watchlist} />
   };
 
   return (
     <TickerProvider>
       <div className="min-h-screen bg-slate-900 text-slate-300 font-sans selection:bg-indigo-500/30">
-        <header className="sticky top-0 z-40 bg-slate-900/80 backdrop-blur-xl border-b border-slate-800">
+        <header className="sticky top-0 z-40 bg-slate-900 border-b border-slate-800">
           <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
             <div className="flex items-center gap-2 text-indigo-400 cursor-pointer" onClick={() => setCurrentView('dashboard')}>
               <div className="w-8 h-8 rounded-lg bg-indigo-500/20 flex items-center justify-center">
@@ -1844,8 +2130,8 @@ export default function App() {
               <span className="text-xl font-bold tracking-tight text-white">AniTrack</span>
             </div>
             <nav className="hidden md:flex gap-1 bg-slate-800/50 p-1 rounded-xl">
-              {['dashboard', 'watchlist', 'seasonal', 'search'].map(v => (
-                <button key={v} onClick={() => { if (v === 'watchlist') setWatchlistFilter('ALL'); setCurrentView(v); }}
+              {NAV.map(n => n.id).map(v => (
+                <button key={v} onClick={() => { if (v === 'watchlist') { setWatchlistFilter('ALL'); setWatchlistSort('title'); } setCurrentView(v); }}
                   className={`px-4 py-1.5 rounded-lg text-sm font-medium capitalize transition-all
                   ${currentView === v ? 'bg-indigo-500 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-700/50'}`}>
                   {v}
@@ -1853,6 +2139,9 @@ export default function App() {
               ))}
             </nav>
             <div className="flex items-center gap-4 text-sm font-medium">
+              <button onClick={() => setShowData(true)} aria-label="Settings and backup" title="Settings & backup" className="p-2 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors">
+                <Settings size={18} />
+              </button>
               <span className="hidden sm:inline-block text-slate-500">
                 {formatLocal(getLocalUnixNow(), { dateStyle: 'long', timeStyle: 'short' })}
               </span>
@@ -1860,25 +2149,54 @@ export default function App() {
           </div>
         </header>
 
-        <div className="md:hidden flex overflow-x-auto gap-2 p-4 bg-slate-900 border-b border-slate-800">
-          {['dashboard', 'watchlist', 'seasonal', 'search'].map(v => (
-            <button key={v} onClick={() => { if (v === 'watchlist') setWatchlistFilter('ALL'); setCurrentView(v); }}
-              className={`flex-shrink-0 px-4 py-2 rounded-lg text-sm font-medium capitalize
-              ${currentView === v ? 'bg-indigo-500 text-white' : 'bg-slate-800 text-slate-400'}`}>
-              {v}
+        <nav aria-label="Main" className="md:hidden fixed bottom-0 inset-x-0 z-40 flex bg-slate-900 border-t border-slate-800 bottom-nav">
+          {NAV.map(({ id, label, Icon }) => (
+            <button key={id} onClick={() => { if (id === 'watchlist') { setWatchlistFilter('ALL'); setWatchlistSort('title'); } setCurrentView(id); }}
+              aria-current={currentView === id ? 'page' : undefined}
+              className={`flex-1 flex flex-col items-center gap-1 py-2.5 text-[11px] font-medium ${currentView === id ? 'text-indigo-400' : 'text-slate-500'}`}>
+              <Icon size={20} />{label}
             </button>
           ))}
-        </div>
+        </nav>
 
         <main className="max-w-7xl mx-auto px-4 py-8 pb-24">
-          {views[currentView]}
+          {offlineAt && (
+            <div role="status" className="mb-6 text-sm bg-slate-800 border border-slate-700 text-slate-300 rounded-xl px-4 py-3">
+              No signal. Showing what we saved {new Date(offlineAt).toLocaleString()}.
+            </div>
+          )}
+          {w.notice && (
+            <div role="alert" className="mb-6 flex items-center justify-between gap-3 text-sm bg-amber-500/10 border border-amber-500/30 text-amber-200 rounded-xl px-4 py-3">
+              <span>{w.notice}</span>
+              <button onClick={w.dismissNotice} className="underline shrink-0">Dismiss</button>
+            </div>
+          )}
+          {w.saveError && (
+            <div role="alert" className="mb-6 text-sm bg-rose-500/10 border border-rose-500/30 text-rose-200 rounded-xl px-4 py-3">
+              {w.saveError} Export a backup now so you don't lose your list.
+            </div>
+          )}
+          {backupDue && (
+            <div className="mb-6 flex items-center justify-between gap-3 text-sm bg-indigo-500/10 border border-indigo-500/30 text-indigo-200 rounded-xl px-4 py-3">
+              <span>Your list only lives on this device. Save a backup file?</span>
+              <span className="flex gap-3 shrink-0">
+                <button onClick={() => setShowData(true)} className="font-semibold underline">Back up</button>
+                <button onClick={() => setNudgeDismissed(true)} aria-label="Dismiss reminder"><X size={16} /></button>
+              </span>
+            </div>
+          )}
+          {!w.loaded ? <CoverGridSkeleton /> : views[currentView]}
         </main>
+
+        {showData && (
+          <DataPanel watchlist={w.watchlist} lastBackupAt={w.lastBackupAt} alertsOn={alertsOn} onToggleAlerts={toggleAlerts} layout={layout} onLayout={changeLayout} onMerge={w.mergeIn} onReplace={w.replaceAll} onClose={closeData} />
+        )}
 
         {selectedAnimeId && (
           <AnimeDetailModal 
             animeId={selectedAnimeId} 
             onClose={closeAnime} 
-            watchlistObj={w} 
+            watchlistObj={{ ...w, updateProgress: uProgress, remove: uRemove }} 
             openAnime={openAnime} 
           />
         )}
