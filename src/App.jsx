@@ -1534,6 +1534,77 @@ const SearchAnime = ({ watchlist, add, openAnime }) => {
   );
 };
 
+const parseTheme = (raw) => {
+  const m = String(raw).match(/^(?:#?\s*(\d+):\s*)?"(.+?)"\s*(?:by\s+(.+?))?\s*(?:\(([^()]*eps?[^()]*)\))?\s*$/i);
+  return m ? { n: m[1], title: m[2], artist: m[3] || '', eps: m[4] || '' } : { n: null, title: String(raw), artist: '', eps: '' };
+};
+const ytSearch = (q) => `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}`;
+const webSearch = (q) => `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+const themeCache = new Map();
+
+// Openings & endings: list comes from MyAnimeList via Jikan. Videos and lyrics open as searches.
+const ThemesSection = ({ malId, animeTitle }) => {
+  const [open, setOpen] = useState(false);
+  const [tries, setTries] = useState(0);
+  const [state, setState] = useState({ status: 'idle', data: null });
+
+  useEffect(() => {
+    if (!open || !malId) return;
+    if (themeCache.has(malId)) { setState({ status: 'ok', data: themeCache.get(malId) }); return; }
+    const controller = new AbortController();
+    setState({ status: 'loading', data: null });
+    fetch(`https://api.jikan.moe/v4/anime/${malId}/themes`, { signal: controller.signal })
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then(j => {
+        const data = { openings: j?.data?.openings || [], endings: j?.data?.endings || [] };
+        themeCache.set(malId, data);
+        setState({ status: 'ok', data });
+      })
+      .catch(e => { if (e.name !== 'AbortError') setState({ status: 'error', data: null }); });
+    return () => controller.abort();
+  }, [open, malId, tries]);
+
+  const groups = state.data ? [['OP', state.data.openings], ['ED', state.data.endings]] : [];
+  const empty = state.status === 'ok' && groups.every(([, list]) => list.length === 0);
+
+  return (
+    <div className="space-y-3">
+      <button onClick={() => setOpen(o => !o)} aria-expanded={open} className="flex items-center gap-2 font-bold text-white text-base">
+        Openings &amp; Endings <ChevronDown size={16} className={`transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && (
+        <div className="space-y-3">
+          {state.status === 'loading' && <Shimmer className="h-16 w-full" />}
+          {state.status === 'error' && (
+            <p className="text-sm text-slate-400">Couldn't load the themes. <button onClick={() => setTries(t => t + 1)} className="text-indigo-400 underline">Retry</button></p>
+          )}
+          {empty && <p className="text-sm text-slate-400">No themes listed for this one.</p>}
+          {groups.map(([kind, list]) => list.map((raw, i) => {
+            const t = parseTheme(raw);
+            const q = `${t.title} ${t.artist}`.trim();
+            return (
+              <div key={`${kind}${i}`} className="rounded-lg bg-slate-800 px-3 py-2.5">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-slate-100">{t.title}</div>
+                    <div className="text-xs text-slate-400">{[t.artist, t.eps].filter(Boolean).join(' · ')}</div>
+                  </div>
+                  <span className="shrink-0 text-[11px] font-bold text-slate-400">{kind}{t.n || i + 1}</span>
+                </div>
+                <div className="flex gap-3 mt-2 text-xs">
+                  <a href={ytSearch(`${animeTitle} ${kind === 'OP' ? 'opening' : 'ending'} ${q}`)} target="_blank" rel="noopener noreferrer" className="text-indigo-400 underline">Watch on YouTube</a>
+                  <a href={webSearch(`${q} romaji lyrics`)} target="_blank" rel="noopener noreferrer" className="text-indigo-400 underline">Find lyrics</a>
+                </div>
+              </div>
+            );
+          }))}
+          {state.status === 'ok' && <p className="text-[11px] text-slate-500">Theme list from MyAnimeList via Jikan. Lyrics open in a web search.</p>}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
   const { watchlist, add, remove, updateStatus, setStatusAndAdd, updateProgress, setScore, setNotes, toggleFavorite } = watchlistObj;
   const [data, setData] = useState(null);
@@ -1950,6 +2021,8 @@ const AnimeDetailModal = ({ animeId, onClose, watchlistObj, openAnime }) => {
                 </div>
               )}
 
+              {data?.idMal && <ThemesSection malId={data.idMal} animeTitle={titleDisplay} />}
+
               {/* Synopsis with normal line heights and compact paragraph spacing */}
               <div className="space-y-2">
                 <h3 className="font-bold text-white text-base">Synopsis</h3>
@@ -2186,6 +2259,10 @@ export default function App() {
             </div>
           )}
           {!w.loaded ? <CoverGridSkeleton /> : views[currentView]}
+
+          <footer className="mt-16 pt-6 border-t border-slate-800 text-center text-xs text-slate-500">
+            AniTrack · made by <a href="https://www.facebook.com/hoshplayss" target="_blank" rel="noopener noreferrer" className="underline hover:text-slate-300">Hosh</a> · Anime data from AniList
+          </footer>
         </main>
 
         {showData && (

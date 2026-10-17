@@ -22,3 +22,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+# Android Keystore and Secrets
+*.jks
+*.keystore
+android/keystore.properties
+android/app/build/
+android/.gradle/
