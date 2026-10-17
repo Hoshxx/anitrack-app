@@ -13,6 +13,7 @@ import {
 import Stats from './Stats.jsx';
 import { useToast } from './Toast.jsx';
 import { Shimmer, CoverGridSkeleton, RowsSkeleton } from './Skeleton.jsx';
+import { Capacitor } from '@capacitor/core';
 import { App as CapApp } from '@capacitor/app';
 import { scheduleAiring, ensurePermission, onWatchedAction } from './notifications.js';
 
@@ -2182,6 +2183,42 @@ export default function App() {
     let handle;
     CapApp.addListener('backButton', () => navRef.current()).then((h) => { handle = h; }).catch(() => {});
     return () => { handle?.remove(); };
+  }, []);
+
+  // Website / installed-PWA only: make the browser Back button close things first.
+  // A spare history entry ("guard") sits on top, so Back reaches us before it leaves the app.
+  // The guard is added on the first tap, because browsers skip entries added with no user interaction.
+  const canBackRef = useRef(false);
+  canBackRef.current = showData || !!selectedAnimeId || currentView !== 'dashboard';
+  useEffect(() => {
+    if (Capacitor.isNativePlatform()) return;
+    let armed = false;
+    let leaving = false;
+    const GUARD = { anitrack: 'guard' };
+    history.replaceState({ anitrack: 'base' }, '');
+    const arm = () => {
+      if (armed) return;
+      armed = true;
+      history.pushState(GUARD, '');
+    };
+    const onPop = () => {
+      if (leaving || history.state?.anitrack === 'guard') return;
+      if (armed && canBackRef.current) {
+        history.pushState(GUARD, '');
+        navRef.current();
+      } else if (armed) {
+        leaving = true;
+        history.back();
+      }
+    };
+    window.addEventListener('pointerdown', arm, { once: true });
+    window.addEventListener('keydown', arm, { once: true });
+    window.addEventListener('popstate', onPop);
+    return () => {
+      window.removeEventListener('pointerdown', arm);
+      window.removeEventListener('keydown', arm);
+      window.removeEventListener('popstate', onPop);
+    };
   }, []);
 
   const toast = useToast();
