@@ -1372,15 +1372,21 @@ const SearchAnime = ({ watchlist, add, openAnime }) => {
   useEffect(() => () => abortRef.current?.abort(), []);
 
   const performSearch = async (searchQuery, p = 1, append = false) => {
-    console.log("performSearch called! Query:", searchQuery, "Filters active:", hasFilters);
+    console.log('[AniTrack] performSearch entered:', {
+      searchQuery,
+      hasFilters
+    });
 
     if (!searchQuery.trim() && !hasFilters) return;
-    abortRef.current?.abort();
+      
+    if (abortRef.current) abortRef.current.abort();
     const controller = new AbortController();
     abortRef.current = controller;
+      
     setLoading(true);
     setError(null);
     setHasSearched(true);
+
     const gqlQuery = `
       query ($search: String, $page: Int, $genre: String, $year: Int, $season: MediaSeason, $format: MediaFormat, $sort: [MediaSort]) {
         Page(page: $page, perPage: 40) {
@@ -1394,43 +1400,56 @@ const SearchAnime = ({ watchlist, add, openAnime }) => {
         }
       }
     `;
+
     try {
-      const data = await fetchGraphQL(gqlQuery, {
+      const cleanSort = filters.sort ? filters.sort : 'POPULARITY_DESC';
+      const variables = {
         search: searchQuery.trim() || null,
-        genre: filters.genre || null,
-        year: filters.year ? Number(filters.year) : null,
-        season: filters.season || null,
-        format: filters.format || null,
-        sort: searchQuery.trim() && (filters.sort === 'POPULARITY_DESC' || filters.sort === 'SEARCH_MATCH') 
-          ? ['SEARCH_MATCH', 'POPULARITY_DESC'] 
-          : [filters.sort],
+        sort: [cleanSort],
         page: p
-      }, controller.signal);
+      };
+
+      if (filters.genre) variables.genre = filters.genre;
+      if (filters.year) variables.year = Number(filters.year);
+      if (filters.season) variables.season = filters.season;
+      if (filters.format) variables.format = filters.format;
+      
+      console.log('[AniTrack] About to call AniList:', variables);
+      const data = await fetchGraphQL(gqlQuery, variables, controller.signal);
+
+      if (!data || !data.Page) {
+        throw new Error("Invalid response structure from AniList");
+      }
+
       if (append) {
         setAnime(prev => {
           const seen = new Set(prev.map(a => a.id));
-          return [...prev, ...data.Page.media.filter(m => !seen.has(m.id))];
+          return [...prev, ...(data.Page.media || []).filter(m => !seen.has(m.id))];
         });
       } else {
-        setAnime(data.Page.media);
+        setAnime(data.Page.media || []);
       }
       setHasNext(data.Page.pageInfo.hasNextPage);
     } catch (e) {
-      console.error("Fetch error details:", e);
       if (e.name === 'AbortError') return;
       setError(e.message === 'rate_limit'
         ? 'AniList asked us to slow down. Try again in a minute.'
         : 'Couldn\'t reach AniList. Check your connection and try again.');
-      if (append) setPage(p - 1); else setAnime([]);
+      if (append) setPage(p - 1); 
+      else setAnime([]);
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
+
 
   const handleSearch = (e) => {
     e.preventDefault();
+    console.log('[AniTrack] Search form submitted:', query);
     setPage(1);
     performSearch(query, 1, false);
   };
+
 
   const loadMore = () => {
     if (loading || !hasNext) return;
