@@ -1399,7 +1399,9 @@ const SearchAnime = ({ watchlist, add, openAnime }) => {
         year: filters.year ? Number(filters.year) : null,
         season: filters.season || null,
         format: filters.format || null,
-        sort: searchQuery.trim() && filters.sort === 'POPULARITY_DESC' ? ['SEARCH_MATCH'] : [filters.sort],
+        sort: searchQuery.trim() && (filters.sort === 'POPULARITY_DESC' || filters.sort === 'SEARCH_MATCH') 
+          ? ['SEARCH_MATCH', 'POPULARITY_DESC'] 
+          : [filters.sort],
         page: p
       }, controller.signal);
       if (append) {
