@@ -1542,6 +1542,52 @@ const ytSearch = (q) => `https://www.youtube.com/results?search_query=${encodeUR
 const webSearch = (q) => `https://www.google.com/search?q=${encodeURIComponent(q)}`;
 const themeCache = new Map();
 
+const wait = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Retries busy/rate-limited responses a couple of times before giving up.
+const fetchJson = async (url, signal, retries = 2) => {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, { signal });
+    if (res.ok) return res.json();
+    const retryable = res.status === 429 || res.status >= 500;
+    if (!retryable || attempt >= retries) throw new Error(`HTTP ${res.status}`);
+    await wait(1200 * (attempt + 1));
+  }
+};
+
+// AnimeThemes -> the same "1: "Title" by Artist" text shape Jikan gives us.
+const fromAnimeThemes = (j) => {
+  const themes = j?.anime?.[0]?.animethemes || [];
+  const build = (type) => themes
+    .filter(t => t.type === type)
+    .sort((a, b) => (a.sequence || 0) - (b.sequence || 0))
+    .map((t, i) => {
+      const artists = (t.song?.artists || []).map(a => a.name).filter(Boolean).join(', ');
+      return `${t.sequence || i + 1}: "${t.song?.title || t.slug}"${artists ? ` by ${artists}` : ''}`;
+    });
+  return { openings: build('OP'), endings: build('ED') };
+};
+
+// MyAnimeList (via Jikan) first; AnimeThemes if Jikan fails or has nothing.
+const loadThemes = async (malId, signal) => {
+  let primary = null, primaryErr = null;
+  try {
+    const j = await fetchJson(`https://api.jikan.moe/v4/anime/${malId}/themes`, signal);
+    primary = { openings: j?.data?.openings || [], endings: j?.data?.endings || [] };
+    if (primary.openings.length || primary.endings.length) return primary;
+  } catch (e) { if (e.name === 'AbortError') throw e; primaryErr = e; }
+
+  let alt = null, altErr = null;
+  try {
+    const q = `${encodeURIComponent('filter[has]')}=resources&${encodeURIComponent('filter[site]')}=MyAnimeList&${encodeURIComponent('filter[external_id]')}=${malId}&include=animethemes.song.artists`;
+    alt = fromAnimeThemes(await fetchJson(`https://api.animethemes.moe/anime?${q}`, signal, 1));
+  } catch (e) { if (e.name === 'AbortError') throw e; altErr = e; }
+
+  if (alt && (alt.openings.length || alt.endings.length)) return alt;
+  if (primary) return primary; // reached the service, nothing listed yet
+  throw new Error(`Jikan: ${primaryErr?.message}${altErr ? `, AnimeThemes: ${altErr.message}` : ''}`);
+};
+
 // Openings & endings: list comes from MyAnimeList via Jikan. Videos and lyrics open as searches.
 const ThemesSection = ({ malId, animeTitle }) => {
   const [open, setOpen] = useState(false);
@@ -1553,14 +1599,9 @@ const ThemesSection = ({ malId, animeTitle }) => {
     if (themeCache.has(malId)) { setState({ status: 'ok', data: themeCache.get(malId) }); return; }
     const controller = new AbortController();
     setState({ status: 'loading', data: null });
-    fetch(`https://api.jikan.moe/v4/anime/${malId}/themes`, { signal: controller.signal })
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-      .then(j => {
-        const data = { openings: j?.data?.openings || [], endings: j?.data?.endings || [] };
-        themeCache.set(malId, data);
-        setState({ status: 'ok', data });
-      })
-      .catch(e => { if (e.name !== 'AbortError') setState({ status: 'error', data: null }); });
+    loadThemes(malId, controller.signal)
+      .then(data => { themeCache.set(malId, data); setState({ status: 'ok', data }); })
+      .catch(e => { if (e.name !== 'AbortError') setState({ status: 'error', data: null, detail: e.message }); });
     return () => controller.abort();
   }, [open, malId, tries]);
 
@@ -1576,7 +1617,7 @@ const ThemesSection = ({ malId, animeTitle }) => {
         <div className="space-y-3">
           {state.status === 'loading' && <Shimmer className="h-16 w-full" />}
           {state.status === 'error' && (
-            <p className="text-sm text-slate-400">Couldn't load the themes. <button onClick={() => setTries(t => t + 1)} className="text-indigo-400 underline">Retry</button></p>
+            <p className="text-sm text-slate-400">Couldn't load the themes{state.detail ? ` (${state.detail})` : ''}. <button onClick={() => setTries(t => t + 1)} className="text-indigo-400 underline">Retry</button></p>
           )}
           {empty && <p className="text-sm text-slate-400">No themes listed for this one.</p>}
           {groups.map(([kind, list]) => list.map((raw, i) => {
@@ -1598,7 +1639,7 @@ const ThemesSection = ({ malId, animeTitle }) => {
               </div>
             );
           }))}
-          {state.status === 'ok' && <p className="text-[11px] text-slate-500">Theme list from MyAnimeList via Jikan. Lyrics open in a web search.</p>}
+          {state.status === 'ok' && <p className="text-[11px] text-slate-500">Theme list from MyAnimeList (Jikan) and AnimeThemes. Lyrics open in a web search.</p>}
         </div>
       )}
     </div>
