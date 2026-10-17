@@ -1416,6 +1416,7 @@ const SearchAnime = ({ watchlist, add, openAnime }) => {
       }
       setHasNext(data.Page.pageInfo.hasNextPage);
     } catch (e) {
+      console.error("Fetch error details:", e);
       if (e.name === 'AbortError') return;
       setError(e.message === 'rate_limit'
         ? 'AniList asked us to slow down. Try again in a minute.'
