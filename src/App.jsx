@@ -707,7 +707,7 @@ const EpisodeRow = ({ episode, itemStatus, itemProgress, onToggleWatched, openAn
         onClick={handleToggle}
         disabled={!isAired}
         className={`flex-shrink-0 w-6 h-6 rounded-md border flex items-center justify-center transition-all
-          ${isWatched ? 'bg-emerald-500 border-emerald-500 text-white' : 'border-slate-600 text-transparent hover:border-indigo-400'}
+          ${isWatched ? 'bg-indigo-500 border-indigo-500 text-white' : 'border-slate-600 text-transparent hover:border-indigo-400'}
           ${!isAired && 'opacity-50 cursor-not-allowed bg-slate-800 border-slate-700'}
         `}
         title={!isAired ? "Episode has not aired yet" : (isWatched ? "Mark unwatched" : "Mark watched")}
@@ -722,11 +722,11 @@ const EpisodeRow = ({ episode, itemStatus, itemProgress, onToggleWatched, openAn
           {episode.media.title?.english || episode.media.title?.romaji}
         </h4>
         <div className="text-xs text-slate-400 mt-0.5 flex items-center gap-2 flex-wrap">
-          <span className="font-medium text-indigo-300">
+          <span className="font-medium text-slate-200">
             Ep {episode.episode} {episode.media.episodes ? `/ ${episode.media.episodes}` : ''}
           </span>
           <span>•</span>
-          <span className={isAired ? "text-emerald-400 font-semibold" : "text-amber-400 font-semibold"}>
+          <span className={isAired ? "text-slate-400" : "text-indigo-400 font-semibold"}>
             {isAired ? "Aired" : "Upcoming"}
           </span>
           <span>•</span>
@@ -779,7 +779,7 @@ const CalendarView = ({ watchlist, updateProgress, updateStatus, add, openAnime 
     if (schedules.length === 0) return <div className="p-8 text-center text-slate-400 bg-slate-800/20 rounded-xl">Quiet day. Nothing airing.</div>;
     
     return (
-      <div className="bg-slate-800/30 rounded-2xl p-2">
+      <div className="bg-slate-800/30 rounded-2xl p-2 grid grid-cols-1 lg:grid-cols-2 lg:gap-x-2">
         {schedules.map(ep => {
           const wItem = watchlist.find(w => w.id === ep.media.id);
           return (
