@@ -1399,7 +1399,7 @@ const SearchAnime = ({ watchlist, add, openAnime }) => {
         year: filters.year ? Number(filters.year) : null,
         season: filters.season || null,
         format: filters.format || null,
-        sort: [filters.sort],
+        sort: searchQuery.trim() && filters.sort === 'POPULARITY_DESC' ? ['SEARCH_MATCH'] : [filters.sort],
         page: p
       }, controller.signal);
       if (append) {
